@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use sqlx::{
     SqlitePool,
@@ -13,6 +14,7 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(30))
         .synchronous(SqliteSynchronous::Normal);
     let pool = SqlitePoolOptions::new()
         .max_connections(8)

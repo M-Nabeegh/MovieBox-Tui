@@ -260,6 +260,32 @@ async fn create_with_id_keeps_job_id_in_partial_paths() {
 }
 
 #[tokio::test]
+async fn sqlite_busy_writes_wait_for_short_locks() {
+    let (_temp_dir, pool, repository) = test_repository().await;
+    let locked_job = repository.create(new_job(90)).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE jobs SET warning = ?1 WHERE id = ?2")
+        .bind("short lock")
+        .bind(locked_job.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let waiter = tokio::spawn({
+        let repository = repository.clone();
+        async move { repository.create(new_job(91)).await }
+    });
+    sleep(Duration::from_secs(6)).await;
+    tx.commit().await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(8), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_ok(), "short SQLite locks should be retried");
+}
+
+#[tokio::test]
 async fn transition_allows_every_legal_state_change() {
     let (_temp_dir, _pool, repository) = test_repository().await;
     let legal = [
