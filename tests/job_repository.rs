@@ -7,14 +7,15 @@ use moviebox_tui::{
     server::{
         db::connect,
         jobs::{
-            JobEvent, JobEventKind, JobListCursor, JobProgress, JobRepository, JobRepositoryError,
-            JobState, NewJob,
+            JobEvent, JobEventKind, JobId, JobListCursor, JobProgress, JobRepository,
+            JobRepositoryError, JobState, NewJob,
         },
     },
 };
 use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
 use tokio::{task::JoinSet, time::sleep};
+use uuid::Uuid;
 
 async fn test_repository() -> (TempDir, SqlitePool, JobRepository) {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -233,6 +234,28 @@ async fn create_persists_job_with_relative_paths_only() {
     assert_eq!(
         stored.get::<Option<String>, _>("subtitle_id"),
         Some("subtitle-1".to_string())
+    );
+}
+
+#[tokio::test]
+async fn create_with_id_keeps_job_id_in_partial_paths() {
+    let (_temp_dir, _pool, repository) = test_repository().await;
+    let uuid = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let job_id = JobId::new(uuid);
+    let mut input = new_job(2);
+    input.partial_video_path = format!("_moviebox/jobs/{uuid}/Episode.mkv.part");
+    input.partial_subtitle_path = Some(format!("_moviebox/jobs/{uuid}/Episode.en.srt.part"));
+
+    let job = repository.create_with_id(job_id, input).await.unwrap();
+
+    assert_eq!(job.id, job_id);
+    assert_eq!(
+        job.partial_video_path,
+        format!("_moviebox/jobs/{uuid}/Episode.mkv.part")
+    );
+    assert_eq!(
+        job.partial_subtitle_path.as_deref(),
+        Some(format!("_moviebox/jobs/{uuid}/Episode.en.srt.part").as_str())
     );
 }
 

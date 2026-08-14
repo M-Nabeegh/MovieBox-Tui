@@ -185,27 +185,30 @@ async fn create(
         .map_err(|_| ApiError::internal())?;
     let job = state
         .jobs()
-        .create(NewJob {
-            catalog_id,
-            source_id,
-            subtitle_id: request.subtitle_id.map(SubtitleId::new),
-            title: details.title,
-            year: details.year,
-            media_type: details.media_type,
-            season_number: request.season,
-            episode_number: request.episode,
-            episode_title: match &identity {
-                MediaIdentity::Episode { episode_title, .. } => episode_title.clone(),
-                _ => None,
+        .create_with_id(
+            JobId::new(id),
+            NewJob {
+                catalog_id,
+                source_id,
+                subtitle_id: request.subtitle_id.map(SubtitleId::new),
+                title: details.title,
+                year: details.year,
+                media_type: details.media_type,
+                season_number: request.season,
+                episode_number: request.episode,
+                episode_title: match &identity {
+                    MediaIdentity::Episode { episode_title, .. } => episode_title.clone(),
+                    _ => None,
+                },
+                requested_height: request.requested_height,
+                final_video_path: paths.video_relative.to_string_lossy().into(),
+                final_subtitle_path: paths.subtitle_relative.map(|p| p.to_string_lossy().into()),
+                partial_video_path: paths.partial_video_relative.to_string_lossy().into(),
+                partial_subtitle_path: paths
+                    .partial_subtitle_relative
+                    .map(|p| p.to_string_lossy().into()),
             },
-            requested_height: request.requested_height,
-            final_video_path: paths.video_relative.to_string_lossy().into(),
-            final_subtitle_path: paths.subtitle_relative.map(|p| p.to_string_lossy().into()),
-            partial_video_path: paths.partial_video_relative.to_string_lossy().into(),
-            partial_subtitle_path: paths
-                .partial_subtitle_relative
-                .map(|p| p.to_string_lossy().into()),
-        })
+        )
         .await
         .map_err(|_| ApiError::internal())?;
     state.events().publish_job(&job, JobEventKind::Created);

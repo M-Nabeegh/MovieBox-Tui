@@ -34,9 +34,16 @@ impl JobRepository {
     }
 
     pub async fn create(&self, input: NewJob) -> Result<DownloadJob, JobRepositoryError> {
+        self.create_with_id(JobId::new(Uuid::new_v4()), input).await
+    }
+
+    pub async fn create_with_id(
+        &self,
+        id: JobId,
+        input: NewJob,
+    ) -> Result<DownloadJob, JobRepositoryError> {
         input.validate()?;
 
-        let id = JobId::new(Uuid::new_v4());
         let created_at_millis = now_millis()?;
         let version = 0_i64;
         let mut tx = self.pool.begin().await?;
