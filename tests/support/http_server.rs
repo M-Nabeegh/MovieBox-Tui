@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use moviebox_tui::server::security::net::{AddressResolver, DownloadClient, ResolveFuture};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::{

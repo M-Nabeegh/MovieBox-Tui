@@ -9,6 +9,7 @@ use super::model::{
     DownloadJob, JobEvent, JobEventKind, JobId, JobListCursor, JobProgress, JobRepositoryError,
     JobState, NewJob, apply_event_fields, can_transition,
 };
+use super::worker::JobStatePatch;
 use crate::catalog::{CatalogId, MediaType, SourceId, SubtitleId};
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,17 @@ pub struct JobRepository {
 impl JobRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn get(&self, id: JobId) -> Result<DownloadJob, JobRepositoryError> {
+        fetch_job_with_executor(&self.pool, id).await
+    }
+
+    pub async fn list_all(&self) -> Result<Vec<DownloadJob>, JobRepositoryError> {
+        let rows = sqlx::query("SELECT * FROM jobs ORDER BY created_at ASC, id ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(|row| job_from_row(&row)).collect()
     }
 
     pub async fn create(&self, input: NewJob) -> Result<DownloadJob, JobRepositoryError> {
@@ -186,7 +198,7 @@ impl JobRepository {
         id: JobId,
         progress: JobProgress,
         event: Option<JobEvent>,
-    ) -> Result<(), JobRepositoryError> {
+    ) -> Result<DownloadJob, JobRepositoryError> {
         let mut tx = self.pool.begin().await?;
         let current = fetch_job_with_executor(&mut *tx, id).await?;
         if current.version != progress.expected_version {
@@ -245,7 +257,76 @@ impl JobRepository {
         )
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(job)
+    }
+
+    pub async fn force_state(
+        &self,
+        id: JobId,
+        expected_version: i64,
+        to: JobState,
+        kind: JobEventKind,
+        patch: JobStatePatch,
+    ) -> Result<DownloadJob, JobRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let current = fetch_job_with_executor(&mut *tx, id).await?;
+        if current.version != expected_version {
+            return Err(JobRepositoryError::Conflict {
+                expected_version,
+                actual_version: current.version,
+            });
+        }
+
+        let downloaded_bytes = patch.downloaded_bytes.unwrap_or(current.downloaded_bytes);
+        let total_bytes = patch.total_bytes.unwrap_or(current.total_bytes);
+        let speed_bytes_per_second = patch
+            .speed_bytes_per_second
+            .unwrap_or(current.speed_bytes_per_second);
+        let error_code = patch.error_code.unwrap_or(current.error_code);
+        let error_message = patch.error_message.unwrap_or(current.error_message);
+        let warning = patch.warning.unwrap_or(current.warning);
+        let row = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET
+                state = ?1,
+                downloaded_bytes = ?2,
+                total_bytes = ?3,
+                speed_bytes_per_second = ?4,
+                error_code = ?5,
+                error_message = ?6,
+                warning = ?7,
+                updated_at = ?8,
+                version = version + 1
+            WHERE id = ?9 AND version = ?10
+            RETURNING *
+            "#,
+        )
+        .bind(to.as_str())
+        .bind(to_i64(downloaded_bytes)?)
+        .bind(total_bytes.map(to_i64).transpose()?)
+        .bind(speed_bytes_per_second.map(to_i64).transpose()?)
+        .bind(error_code)
+        .bind(error_message)
+        .bind(warning)
+        .bind(now_millis()?)
+        .bind(id.to_string())
+        .bind(expected_version)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            let actual = fetch_job_with_executor(&mut *tx, id).await?;
+            return Err(JobRepositoryError::Conflict {
+                expected_version,
+                actual_version: actual.version,
+            });
+        };
+
+        let job = job_from_row(&row)?;
+        insert_event(&mut *tx, &job, kind).await?;
+        tx.commit().await?;
+        Ok(job)
     }
 
     pub async fn list(
