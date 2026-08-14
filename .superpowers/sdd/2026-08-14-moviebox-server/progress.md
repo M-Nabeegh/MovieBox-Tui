@@ -16,7 +16,7 @@ Workspace: `/Users/nabeegh/Documents/Codex/2026-08-14/bro/work/MovieBox-Tui-insp
 - Task 9: complete (React/Vite auth shell, typed client, embedded assets and safe fallback headers; frontend and asset tests clean)
 - Task 10: complete (debounced search, details/source/subtitle selection, 1080p filtering and confirmed job creation; web tests/build clean)
 - Task 11: complete (queue cards, safe controls, SSE refresh/backoff with polling fallback, ready-state UI; web tests/build clean)
-- Task 12: pending
+- Task 12: complete (commit 4ed5a7a; Jellyfin client/route, key redaction, bounded lookup and focused mocks clean)
 - Task 13: pending
 - Task 14: pending
 - Task 15: pending
