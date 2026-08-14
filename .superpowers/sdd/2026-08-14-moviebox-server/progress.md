@@ -12,7 +12,7 @@ Workspace: `/Users/nabeegh/Documents/Codex/2026-08-14/bro/work/MovieBox-Tui-insp
 - Task 5: complete (commits 4aafac7, b646b57; review fixed equal-timestamp pagination and warning panic, re-review clean)
 - Task 6: complete (commits b3914b7, f07e6f4, 81f5406; MVP worker reviews fixed path safety/recovery/deferred-disk behavior, final re-review clean)
 - Task 7: complete (commit 1e03f24; auth/config review findings fixed and focused re-verification clean)
-- Task 8: pending
+- Task 8: complete (MVP authenticated catalog/job/SSE routes; source association and 1080p checks covered; focused API tests clean)
 - Task 9: pending
 - Task 10: pending
 - Task 11: pending

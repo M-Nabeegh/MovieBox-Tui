@@ -25,6 +25,52 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub fn new_status(status: StatusCode, code: &'static str, message: &'static str) -> Self {
+        Self::new(status, code, message)
+    }
+
+    pub fn not_found() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "The requested item was not found.",
+        )
+    }
+    pub fn conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "The requested state transition is not allowed.",
+        )
+    }
+    pub fn quality_exceeds_limit() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "quality_exceeds_limit",
+            "The requested quality exceeds the server limit.",
+        )
+    }
+    pub fn quality_unavailable() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "quality_unavailable",
+            "The requested quality is not available.",
+        )
+    }
+    pub fn provider_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_unavailable",
+            "The catalog provider is temporarily unavailable.",
+        )
+    }
+    pub fn invalid_cursor() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "The pagination cursor is invalid.",
+        )
+    }
     pub fn invalid_request() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
