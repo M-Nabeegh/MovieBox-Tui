@@ -1,0 +1,11 @@
+.git
+.github
+.gitignore
+.superpowers
+target
+web/node_modules
+web/dist
+deploy/compose/secrets
+*.log
+*.swp
+.DS_Store
