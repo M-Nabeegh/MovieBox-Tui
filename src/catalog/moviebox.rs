@@ -592,7 +592,6 @@ impl CatalogProvider for MovieBoxCatalogProvider {
                 usize::from(request.episode.unwrap_or_default()),
                 1,
                 None,
-                200,
             )
             .await?;
         let payload = ensure_object_with_subject_id(payload, &subject_id);
@@ -628,7 +627,6 @@ impl CatalogProvider for MovieBoxCatalogProvider {
                 usize::from(episode.unwrap_or_default()),
                 1,
                 None,
-                200,
             )
             .await?;
         let payload = ensure_object_with_subject_id(payload, &subject_id);

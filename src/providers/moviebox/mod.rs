@@ -24,6 +24,31 @@ impl Provider for client::MovieBoxClient {
 use client::{MovieBoxClient, ScraperError};
 use serde_json::{Value, json};
 
+const RESOURCE_PAGE_SIZE: usize = 20;
+
+fn resource_page_path(
+    subject_id: &str,
+    season: usize,
+    episode: usize,
+    page: usize,
+    resolution: Option<&str>,
+) -> String {
+    let res_param = resolution
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("&resolution={value}"))
+        .unwrap_or_default();
+
+    if season == 0 && episode == 0 {
+        format!(
+            "/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page={page}&perPage={RESOURCE_PAGE_SIZE}{res_param}"
+        )
+    } else {
+        format!(
+            "/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&se={season}&ep={episode}&page={page}&perPage={RESOURCE_PAGE_SIZE}{res_param}"
+        )
+    }
+}
+
 impl MovieBoxClient {
     pub async fn search(&self, query: &str, page: usize) -> Result<Value, ScraperError> {
         let payload = json!({
@@ -84,29 +109,8 @@ impl MovieBoxClient {
         episode: usize,
         page: usize,
         resolution: Option<&str>,
-        per_page: usize,
     ) -> Result<Value, ScraperError> {
-        let res_param = if let Some(r) = resolution {
-            if r.is_empty() {
-                String::new()
-            } else {
-                format!("&resolution={}", r)
-            }
-        } else {
-            String::new()
-        };
-
-        let path = if season == 0 && episode == 0 {
-            format!(
-                "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page={}&perPage={}{}",
-                subject_id, page, per_page, res_param
-            )
-        } else {
-            format!(
-                "/wefeed-mobile-bff/subject-api/resource?subjectId={}&se={}&ep={}&page={}&perPage={}{}",
-                subject_id, season, episode, page, per_page, res_param
-            )
-        };
+        let path = resource_page_path(subject_id, season, episode, page, resolution);
         self.get(&path).await
     }
 
@@ -178,5 +182,18 @@ impl MovieBoxClient {
             subject_id, resource_id
         );
         self.get(&path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resource_page_path;
+
+    #[test]
+    fn resource_page_path_uses_provider_supported_page_size() {
+        assert_eq!(
+            resource_page_path("subject-fixture", 0, 0, 1, None),
+            "/wefeed-mobile-bff/subject-api/resource?subjectId=subject-fixture&page=1&perPage=20"
+        );
     }
 }
