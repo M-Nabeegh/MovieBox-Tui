@@ -1,3 +1,12 @@
 export type ErrorEnvelope = { error: { code: string; message: string; request_id: string; fields: Record<string, string> } };
 export type Session = { authenticated: boolean; username: string; csrf_token: string };
 export type ApiRequestInit = RequestInit & { retryOnAuth?: boolean };
+export type MediaType = "movie" | "series";
+export type CatalogItem = { id: string; title: string; year: string | null; media_type: MediaType; season_count: number | null };
+export type SearchPage = { page: number; items: CatalogItem[]; has_more: boolean };
+export type EpisodeInfo = { number: number; title: string | null };
+export type SeasonInfo = { number: number; episodes: EpisodeInfo[] };
+export type CatalogDetails = { id: string; title: string; media_type: MediaType; year: string | null; description: string | null; tagline: string | null; imdb_rating: string | null; duration: string | null; genres: string[]; country: string | null; seasons: SeasonInfo[]; audio_options: { id: string; label: string; original: boolean }[] };
+export type SourceOption = { id: string; height: number; label: string; size_bytes: number | null; language: string | null; recommended: boolean };
+export type SubtitleTrack = { id: string; language: string; format: string | null };
+export type CreateJobRequest = { catalog_id: string; source_id: string; subtitle_id: string | null; requested_height: number; season?: number; episode?: number };

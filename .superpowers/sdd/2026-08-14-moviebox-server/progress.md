@@ -14,7 +14,7 @@ Workspace: `/Users/nabeegh/Documents/Codex/2026-08-14/bro/work/MovieBox-Tui-insp
 - Task 7: complete (commit 1e03f24; auth/config review findings fixed and focused re-verification clean)
 - Task 8: complete (MVP authenticated catalog/job/SSE routes; source association and 1080p checks covered; focused API tests clean)
 - Task 9: complete (React/Vite auth shell, typed client, embedded assets and safe fallback headers; frontend and asset tests clean)
-- Task 10: pending
+- Task 10: complete (debounced search, details/source/subtitle selection, 1080p filtering and confirmed job creation; web tests/build clean)
 - Task 11: pending
 - Task 12: pending
 - Task 13: pending

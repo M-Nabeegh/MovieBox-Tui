@@ -2,12 +2,17 @@ import { useEffect, useState } from "react";
 import { api, setUnauthorizedHandler } from "./api/client";
 import type { Session } from "./api/types";
 import { LoginPage } from "./features/auth/LoginPage";
+import { SearchPage } from "./features/search/SearchPage";
+import { DetailsDrawer } from "./features/details/DetailsDrawer";
+import type { CatalogItem } from "./api/types";
 
 function Shell({ session, signOut }: { session: Session; signOut: () => Promise<void> }) {
+  const [selected, setSelected] = useState<CatalogItem | null>(null);
+  const [queued, setQueued] = useState(0);
   return <main className="app-shell"><header><div className="brand"><span className="brand-mark">MB</span><span>MovieBox <small>SERVER</small></span></div><button className="quiet-button" onClick={signOut}>Sign out</button></header>
     <section className="hero"><p className="eyebrow">GOOD EVENING, {session.username.toUpperCase()}</p><h1>What are we<br /><em>watching next?</em></h1><p>Search the catalog, choose a source, and keep your library moving.</p></section>
-    <section className="search-panel" role="search" aria-label="Search"><label htmlFor="search">Find a film or series</label><div className="search-row"><input id="search" placeholder="Try “The Bear” or “Dune”" /><button type="button">Search <span aria-hidden="true">↗</span></button></div></section>
-    <div className="shell-grid"><article><p className="eyebrow">CATALOG</p><h2>Ready when you are.</h2><p className="muted">Search results will appear here. The server resolves sources privately and caps downloads at 1080p.</p></article><aside><p className="eyebrow">QUEUE</p><strong>0</strong><p className="muted">active downloads</p></aside></div>
+    <div className="shell-grid"><SearchPage onSelect={setSelected} /><aside><p className="eyebrow">QUEUE</p><strong>{queued}</strong><p className="muted">active downloads</p></aside></div>
+    {selected && <DetailsDrawer item={selected} onClose={() => setSelected(null)} onQueued={() => setQueued((count) => count + 1)} />}
   </main>;
 }
 
