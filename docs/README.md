@@ -27,3 +27,19 @@ layout, runtime behavior, and operational workflows in prose tied to the source 
 
 > Keep this index accurate: when a behavior change lands, update the matching doc in
 > the same change and flip its status to current.
+
+## Self-hosted server
+
+These guides describe the current Docker Compose files. They do not claim a
+remote deployment or verified hardware acceleration.
+
+| Guide | Coverage |
+| --- | --- |
+| [server/architecture.md](server/architecture.md) | Services, data flow, ports |
+| [server/install.md](server/install.md) | Install, secrets, first run, private access |
+| [server/storage.md](server/storage.md) | Data root, mounts, media, disk reserve |
+| [server/security.md](server/security.md) | Authentication, exposure, secrets |
+| [server/backup-restore.md](server/backup-restore.md) | Backup and restore |
+| [server/troubleshooting.md](server/troubleshooting.md) | Health, logs, queue, Jellyfin |
+| [server/update-uninstall.md](server/update-uninstall.md) | Update, stop, remove, data retention |
+| [server/attribution.md](server/attribution.md) | Fork, licenses, content rights |

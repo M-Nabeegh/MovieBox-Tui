@@ -20,7 +20,7 @@ Workspace: `/Users/nabeegh/Documents/Codex/2026-08-14/bro/work/MovieBox-Tui-insp
 - Task 13: complete (commit 9e1eb47; static Compose policy clean; local Docker/Bats unavailable for runtime validation)
 - Task 14: complete (commit 03a2f38; guarded dry-run/conflict checks passed; Bats/ShellCheck unavailable locally)
 - Task 15: complete (CI/web/audit gates wired; synthetic fixture and opt-in Playwright flow added; local e2e skips without fixture server)
-- Task 16: pending
+- Task 16: complete (README/server guides and contract test added; remote deployment/hardware claims explicitly left unverified)
 - Task 17: pending
 
 ## Review ledger

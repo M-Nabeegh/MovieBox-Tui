@@ -4,6 +4,8 @@
 
 Search, browse, play, and download movies, series, anime, and IPTV streams from a keyboard-first terminal interface using external media players.
 
+This repository is an independently maintained fork of [`mesamirh/MovieBox-Tui`](https://github.com/mesamirh/MovieBox-Tui), not an official upstream edition. It preserves the original TUI path and adds an optional self-hosted MovieBox Server for a private Docker and Jellyfin workflow.
+
 [![Crates.io](https://img.shields.io/crates/v/moviebox-tui.svg?logo=rust)](https://crates.io/crates/moviebox-tui)
 [![CI](https://github.com/mesamirh/MovieBox-Tui/actions/workflows/ci.yml/badge.svg)](https://github.com/mesamirh/MovieBox-Tui/actions/workflows/ci.yml)
 [![Platforms](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20Android-brightgreen)](#requirements)
@@ -19,6 +21,32 @@ This README is the project landing page (features, install, usage). The full
 documentation set — architecture, providers, players, cache, logging, TV mode,
 configuration, and debugging — lives in [`docs/`](docs/README.md). Contribution
 guidance is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Self-host MovieBox Server
+
+The server searches MovieBox, resolves provider links server-side, queues resumable downloads, and writes Jellyfin-compatible media. The browser receives opaque IDs, not provider URLs or tokens. Compose runs the server beside the official Jellyfin image:
+
+```text
+Private browser -> Tailscale Serve or trusted LAN proxy -> MovieBox Server :8420
+                                                   \-> Jellyfin :8096
+MovieBox Server and Jellyfin share the media root; Jellyfin mounts it read-only.
+```
+
+The server enforces a 1080p maximum, one download worker, and a 10 GiB free-space reserve. Compose publishes host ports only on `127.0.0.1`; it does not expose the stack directly to the LAN or Internet. Tailscale Serve is optional and private; this repository does not use Funnel or router port forwarding.
+
+Quick start from the repository root:
+
+```bash
+cp deploy/compose/.env.example deploy/compose/.env
+umask 077
+mkdir -p deploy/compose/secrets
+openssl rand -base64 32 > deploy/compose/secrets/admin_password.txt
+openssl rand -base64 48 > deploy/compose/secrets/session_key.txt
+docker compose --env-file deploy/compose/.env -f deploy/compose/compose.yml up -d --build
+docker compose --env-file deploy/compose/.env -f deploy/compose/compose.yml ps
+```
+
+Edit `MOVIEBOX_DATA_ROOT`, UID, and GID for the host. The personal homeserver convention is `/mnt/nas-data/moviebox`; other operators must choose their own dedicated data root. This repository does not claim that a remote server is deployed or that hardware acceleration is verified. See the [server operations guides](docs/README.md#self-hosted-server), including [backup](docs/server/backup-restore.md), [uninstall](docs/server/update-uninstall.md), and [troubleshooting](docs/server/troubleshooting.md).
 
 ## Features
 
