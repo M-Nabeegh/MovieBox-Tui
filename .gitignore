@@ -20,4 +20,5 @@ debug_*.json
 *.log
 dist/
 web/node_modules/
+web/test-results/
 deploy/compose/secrets/*.txt
