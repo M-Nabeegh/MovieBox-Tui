@@ -12,7 +12,7 @@ set -eu
 printf '%s\n' "$*" >>"$CALLS_FILE"
 case "$*" in
   "serve status --json") cat "$STATUS_JSON" ;;
-  "serve get-config "*) printf '%s\n' '{"TCP":{}}' >"$3" ;;
+  "serve get-config --all") printf '%s\n' '{"TCP":{}}' ;;
   *) : ;;
 esac
 EOF
@@ -53,8 +53,7 @@ teardown() {
 
   [ "$status" -eq 0 ]
   run cat "$calls_file"
-  [[ "$output" == *"serve get-config "* ]]
-  [[ "$output" == *" --all"* ]]
+  [[ "$output" == *"serve get-config --all"* ]]
   [ -s "$TAILSCALE_BACKUP_DIR"/serve-config-*.json ]
 }
 
