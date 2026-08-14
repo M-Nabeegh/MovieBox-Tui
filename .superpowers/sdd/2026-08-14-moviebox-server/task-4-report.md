@@ -13,6 +13,8 @@ Implemented Jellyfin-compatible, collision-safe media naming for the server feat
 - Sanitized path components for control characters, path separators, traversal-like dot segments, reserved Windows device names, and long titles while preserving Unicode titles instead of ASCII-folding them.
 - Normalized title, language, extension, and generated naming components to Unicode NFC before sanitization, reserved-name checks, truncation, and path generation.
 - Added a feature-gated `unicode-normalization` dependency and byte-aware component budgeting so final, subtitle, and partial filenames remain within 255 bytes while retaining the existing grapheme limits.
+- Reserved a fixed worst-case subtitle suffix budget from the configured sanitized-language limit and longest supported subtitle extension, keeping the media stem stable when subtitles are absent or language labels vary.
+- Applied Windows reserved-name protection to the basename before the first dot, including dotted inputs such as `NUL.txt`, `CON.log`, and `COM1.srt`.
 - Matched series episodes by season/episode number independently of episode-title presence; missing catalog titles now retain a valid `SxxExx` stem.
 - Kept all output paths relative to the configured media root and validated them through the existing `contained_path` policy before returning them.
 - Added deterministic completed-target collision handling that returns `LibraryError::AlreadyExists` instead of inventing suffixes like `_2`.
@@ -24,7 +26,7 @@ Implemented Jellyfin-compatible, collision-safe media naming for the server feat
 
 - `cargo fmt` — passed.
 - `cargo fmt --check` — passed.
-- `cargo test --locked --features server --test library_naming` — passed, 12 tests, including NFC-equivalence, multibyte byte-limit, and missing-episode-title regressions.
+- `cargo test --locked --features server --test library_naming` — passed, 14 tests, including NFC-equivalence, multibyte byte-limit, subtitle-independent stems, dotted reserved names, and missing-episode-title regressions.
 - `cargo clippy --all-targets --all-features --locked -- -D warnings` — passed.
 - `cargo build --locked` — passed.
 - `cargo build --locked --all-features` — passed.
@@ -32,4 +34,4 @@ Implemented Jellyfin-compatible, collision-safe media naming for the server feat
 
 ## Residual concern
 
-The 255-byte cap is a conservative common filesystem limit and is validated in the naming boundary; real Jellyfin importer behavior and filesystem fixtures remain deployment-level validation for later tasks. No media is created and no external service is called by these tests.
+The 128-byte sanitized-language cap deliberately truncates unusually long language labels to keep stems identity-stable under the 255-byte component limit; real Jellyfin importer behavior and filesystem fixtures remain deployment-level validation for later tasks. No media is created and no external service is called by these tests.

@@ -13,7 +13,8 @@ use crate::{
 const MAX_COMPONENT_GRAPHEMES: usize = 120;
 const MAX_COMPONENT_BYTES: usize = 255;
 const MAX_LANGUAGE_GRAPHEMES: usize = 48;
-const MAX_LANGUAGE_BYTES: usize = 230;
+const MAX_LANGUAGE_BYTES: usize = 128;
+const MAX_SUPPORTED_SUBTITLE_EXTENSION_BYTES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaIdentity {
@@ -134,7 +135,7 @@ impl LibraryNamer {
                 ))
             })
             .transpose()?;
-        let max_stem_bytes = filename_stem_byte_limit(&video_extension, subtitle.as_ref());
+        let max_stem_bytes = filename_stem_byte_limit(&video_extension);
 
         let (video_relative, subtitle_relative, stem) = match identity {
             MediaIdentity::Movie { title, year } => {
@@ -378,6 +379,8 @@ fn sanitize_component(value: &str) -> String {
         )
     };
 
+    let component = ensure_non_reserved(component);
+    let component = truncate_component(&component, MAX_COMPONENT_GRAPHEMES, MAX_COMPONENT_BYTES);
     ensure_non_reserved(component)
 }
 
@@ -401,11 +404,14 @@ fn collapse_double_dots(value: &str) -> String {
 }
 
 fn ensure_non_reserved(mut component: String) -> String {
+    component = component.nfc().collect::<String>();
     if component.is_empty() {
         component.push_str("Untitled");
     }
 
-    let upper = component.to_ascii_uppercase();
+    let basename_end = component.find('.').unwrap_or(component.len());
+    let basename = &component[..basename_end];
+    let upper = basename.to_ascii_uppercase();
     let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || upper
             .strip_prefix("COM")
@@ -414,7 +420,7 @@ fn ensure_non_reserved(mut component: String) -> String {
                 number.len() == 1 && number.bytes().all(|byte| matches!(byte, b'1'..=b'9'))
             });
     if reserved {
-        component.push('_');
+        component.insert(basename_end, '_');
     }
     component
 }
@@ -480,12 +486,12 @@ fn truncate_to_utf8_bytes(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
-fn filename_stem_byte_limit(video_extension: &str, subtitle: Option<&(String, String)>) -> usize {
+fn filename_stem_byte_limit(video_extension: &str) -> usize {
     let video_partial_suffix_len = 1 + video_extension.len() + ".part".len();
-    let subtitle_partial_suffix_len = subtitle
-        .map(|(language, extension)| 1 + language.len() + 1 + extension.len() + ".part".len())
-        .unwrap_or(0);
-    MAX_COMPONENT_BYTES.saturating_sub(video_partial_suffix_len.max(subtitle_partial_suffix_len))
+    let worst_case_subtitle_partial_suffix_len =
+        1 + MAX_LANGUAGE_BYTES + 1 + MAX_SUPPORTED_SUBTITLE_EXTENSION_BYTES + ".part".len();
+    MAX_COMPONENT_BYTES
+        .saturating_sub(video_partial_suffix_len.max(worst_case_subtitle_partial_suffix_len))
 }
 
 fn count_graphemes(value: &str) -> usize {

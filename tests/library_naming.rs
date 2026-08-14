@@ -143,6 +143,85 @@ fn subtitle_sidecars_keep_the_same_stem_and_sanitize_language() {
 }
 
 #[test]
+fn video_stems_are_stable_when_subtitles_are_added() {
+    let (_temp, namer) = namer();
+    let long_title = "😀界".repeat(200);
+    let identity = MediaIdentity::from_details(&movie(&long_title, "2024"), None, None).unwrap();
+    let long_language = "字幕😀".repeat(100);
+
+    let without_subtitle = namer
+        .paths_for(&identity, "webm", None, Uuid::nil())
+        .unwrap();
+    let with_subtitle = namer
+        .paths_for(
+            &identity,
+            "webm",
+            Some((&long_language, "ssa")),
+            Uuid::nil(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        without_subtitle.video_relative,
+        with_subtitle.video_relative
+    );
+    assert_eq!(
+        without_subtitle.video_relative.file_stem(),
+        with_subtitle.video_relative.file_stem()
+    );
+}
+
+#[test]
+fn dotted_windows_reserved_names_are_safe_components() {
+    let (_temp, namer) = namer();
+
+    let nul_paths = namer
+        .paths_for(
+            &MediaIdentity::from_details(&movie("NUL.txt", "2024"), None, None).unwrap(),
+            "mkv",
+            None,
+            Uuid::nil(),
+        )
+        .unwrap();
+    assert_eq!(
+        nul_paths.video_relative,
+        PathBuf::from("Movies/NUL_.txt (2024)/NUL_.txt (2024).mkv")
+    );
+
+    let con_paths = namer
+        .paths_for(
+            &MediaIdentity::from_details(&movie("CON.log", "2024"), None, None).unwrap(),
+            "mkv",
+            None,
+            Uuid::nil(),
+        )
+        .unwrap();
+    assert_eq!(
+        con_paths.video_relative,
+        PathBuf::from("Movies/CON_.log (2024)/CON_.log (2024).mkv")
+    );
+
+    let com_paths = namer
+        .paths_for(
+            &MediaIdentity::from_details(&movie("COM1.srt", "2024"), None, None).unwrap(),
+            "mkv",
+            Some(("COM1.srt", "srt")),
+            Uuid::nil(),
+        )
+        .unwrap();
+    assert_eq!(
+        com_paths.video_relative,
+        PathBuf::from("Movies/COM1_.srt (2024)/COM1_.srt (2024).mkv")
+    );
+    assert_eq!(
+        com_paths.subtitle_relative,
+        Some(PathBuf::from(
+            "Movies/COM1_.srt (2024)/COM1_.srt (2024).COM1_.srt.srt"
+        ))
+    );
+}
+
+#[test]
 fn canonically_equivalent_titles_and_languages_generate_identical_paths() {
     let (_temp, namer) = namer();
     let precomposed = MediaIdentity::from_details(&movie("Café", "2024"), None, None).unwrap();
