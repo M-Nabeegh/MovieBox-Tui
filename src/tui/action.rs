@@ -66,7 +66,10 @@ pub enum Action {
     SelectBrowse(crate::tui::state::BrowsePreset),
     LaunchMpv(String, Option<String>),
     DownloadStream(Option<String>),
-    StartDownload(Option<String>, Option<String>),
+    StartDownload(
+        Option<String>,
+        Option<crate::providers::models::PlaybackSource>,
+    ),
     UpdateDownload(Option<f64>, Option<String>),
     DownloadCompleted(String),
     DownloadFailed(String),

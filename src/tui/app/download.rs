@@ -6,12 +6,12 @@ impl App {
     pub(super) fn start_resilient_download(
         &mut self,
         subtitle_url: Option<String>,
-        link: Option<String>,
+        source: Option<crate::providers::models::PlaybackSource>,
     ) {
         if self.state.download_progress.is_some() || self.state.active_screen != Screen::Details {
             return;
         }
-        let Some(link) = link else {
+        let Some(source) = source else {
             if self.state.is_fetching_streams {
                 self.state.is_waiting_for_download_stream = true;
                 self.state.notify(
@@ -27,6 +27,53 @@ impl App {
                 );
             }
             return;
+        };
+        let headers = match crate::download::header_map(&source.headers) {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.state.notify(
+                    NotificationKind::Error,
+                    "Download unavailable",
+                    error.to_string(),
+                );
+                return;
+            }
+        };
+        let download_request = match url::Url::parse(&source.url) {
+            Ok(url) => crate::download::DownloadRequest {
+                url,
+                headers: headers.clone(),
+                maximum_redirects: 5,
+            },
+            Err(error) => {
+                self.state.notify(
+                    NotificationKind::Error,
+                    "Download unavailable",
+                    format!("Invalid download URL: {error}"),
+                );
+                return;
+            }
+        };
+        let subtitle_request = subtitle_url
+            .as_deref()
+            .map(|subtitle| {
+                url::Url::parse(subtitle).map(|url| crate::download::DownloadRequest {
+                    url,
+                    headers: headers.clone(),
+                    maximum_redirects: 5,
+                })
+            })
+            .transpose();
+        let subtitle_request = match subtitle_request {
+            Ok(request) => request,
+            Err(error) => {
+                self.state.notify(
+                    NotificationKind::Error,
+                    "Download unavailable",
+                    format!("Invalid subtitle URL: {error}"),
+                );
+                return;
+            }
         };
 
         let title = self
@@ -122,8 +169,9 @@ impl App {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .tcp_keepalive(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| self.client.http_client().clone());
+            .expect("download HTTP client configuration should be valid");
 
         tokio::spawn(async move {
             if let Err(error) = tokio::fs::create_dir_all(&target_dir).await {
@@ -135,8 +183,10 @@ impl App {
                 return;
             }
 
-            if let Some(subtitle_url) = subtitle_url {
-                let subtitle_extension = subtitle_url
+            if let Some(subtitle_request) = subtitle_request {
+                let subtitle_extension = subtitle_request
+                    .url
+                    .path()
                     .rsplit('.')
                     .next()
                     .map(|extension| extension.to_ascii_lowercase())
@@ -145,39 +195,20 @@ impl App {
                     })
                     .unwrap_or_else(|| "srt".to_string());
                 let subtitle_path = destination.with_extension(subtitle_extension);
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    client.get(subtitle_url).send(),
-                )
+                let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    crate::download::fetch_bytes(&client, &subtitle_request).await
+                })
                 .await;
                 match result {
-                    Ok(Ok(response)) => match response.error_for_status() {
-                        Ok(response) => match response.bytes().await {
-                            Ok(bytes) => {
-                                if let Err(error) = tokio::fs::write(subtitle_path, bytes).await {
-                                    sender
-                                        .send(Action::SetStatus(format!(
-                                            "Error: subtitle write failed: {error}"
-                                        )))
-                                        .ok();
-                                }
-                            }
-                            Err(error) => {
-                                sender
-                                    .send(Action::SetStatus(format!(
-                                        "Error: subtitle download failed: {error}"
-                                    )))
-                                    .ok();
-                            }
-                        },
-                        Err(error) => {
+                    Ok(Ok(bytes)) => {
+                        if let Err(error) = tokio::fs::write(subtitle_path, bytes).await {
                             sender
                                 .send(Action::SetStatus(format!(
-                                    "Error: subtitle download failed: {error}"
+                                    "Error: subtitle write failed: {error}"
                                 )))
                                 .ok();
                         }
-                    },
+                    }
                     Ok(Err(error)) => {
                         sender
                             .send(Action::SetStatus(format!(
@@ -196,8 +227,12 @@ impl App {
             }
 
             let progress_sender = sender.clone();
-            let result =
-                crate::download::download(&client, &link, &destination, cancel, move |progress| {
+            let result = crate::download::download(
+                &client,
+                download_request,
+                &destination,
+                cancel,
+                move |progress| {
                     let total = progress.total.unwrap_or_default();
                     let percentage = if total > 0 {
                         progress.downloaded as f64 / total as f64 * 100.0
@@ -232,8 +267,9 @@ impl App {
                     progress_sender
                         .send(Action::UpdateDownload(Some(percentage), Some(status)))
                         .ok();
-                })
-                .await;
+                },
+            )
+            .await;
 
             match result {
                 Ok(crate::download::DownloadOutcome::Completed { .. }) => {
@@ -290,7 +326,7 @@ impl App {
                                 None,
                             );
                             sender_clone
-                                .send(Action::StartDownload(subtitle_url, Some(source.url)))
+                                .send(Action::StartDownload(subtitle_url, Some(source)))
                                 .ok();
                             return None;
                         } else {
@@ -301,7 +337,7 @@ impl App {
                             match client.resolve_release(&release).await {
                                 Ok(source) => {
                                     sender
-                                        .send(Action::StartDownload(subtitle_url, Some(source.url)))
+                                        .send(Action::StartDownload(subtitle_url, Some(source)))
                                         .ok();
                                 }
                                 Err(error) => {
@@ -318,18 +354,22 @@ impl App {
                             .ok();
                     }
                 } else {
+                    let source = self.get_selected_link().map(|link| {
+                        crate::providers::models::PlaybackSource::bare(
+                            self.current_subject_provider(),
+                            link,
+                            None,
+                        )
+                    });
                     self.action_sender
-                        .send(Action::StartDownload(
-                            subtitle_url,
-                            self.get_selected_link(),
-                        ))
+                        .send(Action::StartDownload(subtitle_url, source))
                         .ok();
                 }
                 return None;
             }
-            Action::StartDownload(subtitle_url, link) => {
+            Action::StartDownload(subtitle_url, source) => {
                 self.state.is_resolving_playback = false;
-                self.start_resilient_download(subtitle_url, link);
+                self.start_resilient_download(subtitle_url, source);
                 return None;
             }
             Action::PromptDownloadEpisode => {

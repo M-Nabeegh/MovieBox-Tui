@@ -1,6 +1,9 @@
 use reqwest::{
-    Client, StatusCode,
-    header::{ACCEPT_RANGES, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE},
+    Client, Method, StatusCode,
+    header::{
+        ACCEPT_RANGES, CONTENT_RANGE, ETAG, HeaderMap, HeaderName, HeaderValue, IF_RANGE,
+        LAST_MODIFIED, RANGE,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,10 +16,23 @@ use std::{
 };
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use url::Url;
+
+#[cfg(feature = "server")]
+use crate::server::security::net::{NetSecurityError, follow_checked_redirects};
+
+#[cfg(not(feature = "server"))]
+mod security_net {
+    include!("server/security/net.rs");
+}
+
+#[cfg(not(feature = "server"))]
+use security_net::{NetSecurityError, follow_checked_redirects};
 
 const MAX_ATTEMPTS: usize = 4;
 const SEGMENT_THRESHOLD: u64 = 32 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 8;
+const DEFAULT_MAXIMUM_REDIRECTS: u8 = 5;
 
 pub fn safe_file_stem(value: &str) -> String {
     let mut stem = value
@@ -69,16 +85,37 @@ pub enum DownloadOutcome {
     Paused { bytes: u64 },
 }
 
+#[derive(Debug, Clone)]
+pub struct DownloadRequest {
+    pub url: Url,
+    pub headers: HeaderMap,
+    pub maximum_redirects: u8,
+}
+
+impl DownloadRequest {
+    pub fn new(url: Url) -> Self {
+        Self {
+            url,
+            headers: HeaderMap::new(),
+            maximum_redirects: DEFAULT_MAXIMUM_REDIRECTS,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("server returned HTTP {0}")]
     Http(StatusCode),
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
+    #[error("unsafe network target: {0}")]
+    UnsafeNetwork(#[from] NetSecurityError),
     #[error("file error: {0}")]
     File(#[from] std::io::Error),
     #[error("invalid partial response: {0}")]
     InvalidRange(String),
+    #[error("invalid request header: {0}")]
+    InvalidHeader(String),
     #[error("download ended at {downloaded} of {expected} bytes")]
     Incomplete { downloaded: u64, expected: u64 },
     #[error("download paused")]
@@ -95,7 +132,7 @@ struct ResumeMetadata {
 
 pub async fn download<F>(
     client: &Client,
-    url: &str,
+    request: DownloadRequest,
     destination: &Path,
     cancel: Arc<AtomicBool>,
     mut report: F,
@@ -110,6 +147,7 @@ where
     let mut last_report = Instant::now() - Duration::from_secs(1);
     let mut last_error = None;
     let mut segmented_disabled = false;
+    let mut current_url = request.url.clone();
 
     for attempt in 1..=MAX_ATTEMPTS {
         if cancel.load(Ordering::Relaxed) {
@@ -119,22 +157,31 @@ where
         }
 
         let mut offset = file_len(&partial).await;
-        let mut request = client.get(url);
+        let mut headers = request.headers.clone();
         if offset > 0 {
-            request = request.header(RANGE, format!("bytes={offset}-"));
+            insert_header(&mut headers, RANGE, &format!("bytes={offset}-"))?;
             if let Some(validator) = metadata.etag.as_ref().or(metadata.last_modified.as_ref()) {
-                request = request.header(IF_RANGE, validator);
+                insert_header(&mut headers, IF_RANGE, validator)?;
             }
         }
 
-        let response = match request.send().await {
+        let response = match follow_checked_redirects(
+            client,
+            Method::GET,
+            current_url.clone(),
+            headers,
+            request.maximum_redirects,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
-                last_error = Some(DownloadError::Network(error));
+                last_error = Some(DownloadError::UnsafeNetwork(error));
                 retry_delay(attempt).await;
                 continue;
             }
         };
+        current_url = response.url().clone();
 
         if response.status() == StatusCode::RANGE_NOT_SATISFIABLE && metadata.total == Some(offset)
         {
@@ -174,7 +221,8 @@ where
             drop(response);
             match download_segmented(
                 client,
-                url,
+                &request,
+                &current_url,
                 destination,
                 &metadata_path,
                 current_metadata,
@@ -318,9 +366,11 @@ where
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_segmented<F>(
     client: &Client,
-    url: &str,
+    request: &DownloadRequest,
+    url: &Url,
     destination: &Path,
     metadata_path: &Path,
     metadata: ResumeMetadata,
@@ -355,7 +405,8 @@ where
 
     for (index, (start, end)) in ranges.iter().copied().enumerate() {
         let client = client.clone();
-        let url = url.to_string();
+        let request = request.clone();
+        let url = url.clone();
         let path = segment_path(destination, index);
         let cancel = cancel.clone();
         let progress_sender = progress_sender.clone();
@@ -363,6 +414,7 @@ where
         tasks.spawn(async move {
             download_segment(
                 &client,
+                &request,
                 &url,
                 &path,
                 start,
@@ -470,7 +522,8 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
     client: &Client,
-    url: &str,
+    request: &DownloadRequest,
+    url: &Url,
     path: &Path,
     start: u64,
     end: u64,
@@ -491,16 +544,27 @@ async fn download_segment(
             return Ok(());
         }
         let requested_start = start + existing;
-        let mut request = client
-            .get(url)
-            .header(RANGE, format!("bytes={requested_start}-{end}"));
+        let mut headers = request.headers.clone();
+        insert_header(
+            &mut headers,
+            RANGE,
+            &format!("bytes={requested_start}-{end}"),
+        )?;
         if let Some(validator) = &validator {
-            request = request.header(IF_RANGE, validator);
+            insert_header(&mut headers, IF_RANGE, validator)?;
         }
-        let response = match request.send().await {
+        let response = match follow_checked_redirects(
+            client,
+            Method::GET,
+            url.clone(),
+            headers,
+            request.maximum_redirects,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
-                last_error = Some(DownloadError::Network(error));
+                last_error = Some(DownloadError::UnsafeNetwork(error));
                 retry_delay(attempt).await;
                 continue;
             }
@@ -577,6 +641,36 @@ async fn download_segment(
         downloaded: file_len(path).await,
         expected,
     }))
+}
+
+pub async fn fetch_bytes(
+    client: &Client,
+    request: &DownloadRequest,
+) -> Result<Vec<u8>, DownloadError> {
+    let response = follow_checked_redirects(
+        client,
+        Method::GET,
+        request.url.clone(),
+        request.headers.clone(),
+        request.maximum_redirects,
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Err(DownloadError::Http(response.status()));
+    }
+    Ok(response.bytes().await?.to_vec())
+}
+
+pub fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, DownloadError> {
+    let mut result = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| DownloadError::InvalidHeader(error.to_string()))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|error| DownloadError::InvalidHeader(error.to_string()))?;
+        result.insert(name, value);
+    }
+    Ok(result)
 }
 
 fn segment_count(total: u64) -> usize {
@@ -699,6 +793,17 @@ async fn read_metadata(path: &Path) -> ResumeMetadata {
 async fn write_metadata(path: &Path, metadata: &ResumeMetadata) -> Result<(), std::io::Error> {
     let bytes = serde_json::to_vec(metadata).map_err(std::io::Error::other)?;
     tokio::fs::write(path, bytes).await
+}
+
+fn insert_header(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    value: &str,
+) -> Result<(), DownloadError> {
+    let value = HeaderValue::from_str(value)
+        .map_err(|error| DownloadError::InvalidHeader(error.to_string()))?;
+    headers.insert(name, value);
+    Ok(())
 }
 
 fn header_string(
