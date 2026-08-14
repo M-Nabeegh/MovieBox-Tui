@@ -18,7 +18,7 @@ Workspace: `/Users/nabeegh/Documents/Codex/2026-08-14/bro/work/MovieBox-Tui-insp
 - Task 11: complete (queue cards, safe controls, SSE refresh/backoff with polling fallback, ready-state UI; web tests/build clean)
 - Task 12: complete (commit 4ed5a7a; Jellyfin client/route, key redaction, bounded lookup and focused mocks clean)
 - Task 13: complete (commit 9e1eb47; static Compose policy clean; local Docker/Bats unavailable for runtime validation)
-- Task 14: pending
+- Task 14: complete (commit 03a2f38; guarded dry-run/conflict checks passed; Bats/ShellCheck unavailable locally)
 - Task 15: pending
 - Task 16: pending
 - Task 17: pending
