@@ -638,7 +638,7 @@ Expected: FAIL because routes and sessions do not exist.
 
 - [ ] **Step 2: Validate exact configuration**
 
-Require loopback bind address, database URL, media/partial/config paths, admin password file, session key file, 1080 maximum, 10 GiB reserve, concurrency 1, Jellyfin base URL, optional Jellyfin API key file, and log format. Reject `/mnt/mac-remote`, root `/`, world-writable secret files, non-loopback bind in private mode, and maximum height above 1080.
+Require a valid bind address, database URL, media/partial/config paths, admin password file, session key file, 1080 maximum, 10 GiB reserve, concurrency 1, Jellyfin base URL, optional Jellyfin API key file, and log format. The server may bind `0.0.0.0:8420` inside its container; private exposure is enforced by Compose publishing the host port only as `127.0.0.1:8420`. Reject `/mnt/mac-remote`, root `/`, world-writable secret files, and maximum height above 1080.
 
 - [ ] **Step 3: Implement first-run admin bootstrap**
 
