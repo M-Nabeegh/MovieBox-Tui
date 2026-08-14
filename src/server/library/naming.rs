@@ -417,7 +417,8 @@ fn ensure_non_reserved(mut component: String) -> String {
             .strip_prefix("COM")
             .or_else(|| upper.strip_prefix("LPT"))
             .is_some_and(|number| {
-                number.len() == 1 && number.bytes().all(|byte| matches!(byte, b'1'..=b'9'))
+                matches!(number, "¹" | "²" | "³")
+                    || (number.len() == 1 && number.bytes().all(|byte| matches!(byte, b'1'..=b'9')))
             });
     if reserved {
         component.insert(basename_end, '_');

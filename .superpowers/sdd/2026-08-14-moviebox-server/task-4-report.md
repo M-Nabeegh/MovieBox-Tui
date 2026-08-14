@@ -15,6 +15,7 @@ Implemented Jellyfin-compatible, collision-safe media naming for the server feat
 - Added a feature-gated `unicode-normalization` dependency and byte-aware component budgeting so final, subtitle, and partial filenames remain within 255 bytes while retaining the existing grapheme limits.
 - Reserved a fixed worst-case subtitle suffix budget from the configured sanitized-language limit and longest supported subtitle extension, keeping the media stem stable when subtitles are absent or language labels vary.
 - Applied Windows reserved-name protection to the basename before the first dot, including dotted inputs such as `NUL.txt`, `CON.log`, and `COM1.srt`.
+- Covered Windows device-name variants `COM¹`/`COM²`/`COM³` and `LPT¹`/`LPT²`/`LPT³` alongside the existing ASCII `1`–`9` forms.
 - Matched series episodes by season/episode number independently of episode-title presence; missing catalog titles now retain a valid `SxxExx` stem.
 - Kept all output paths relative to the configured media root and validated them through the existing `contained_path` policy before returning them.
 - Added deterministic completed-target collision handling that returns `LibraryError::AlreadyExists` instead of inventing suffixes like `_2`.
@@ -26,7 +27,7 @@ Implemented Jellyfin-compatible, collision-safe media naming for the server feat
 
 - `cargo fmt` — passed.
 - `cargo fmt --check` — passed.
-- `cargo test --locked --features server --test library_naming` — passed, 14 tests, including NFC-equivalence, multibyte byte-limit, subtitle-independent stems, dotted reserved names, and missing-episode-title regressions.
+- `cargo test --locked --features server --test library_naming` — passed, 15 tests, including NFC-equivalence, multibyte byte-limit, subtitle-independent stems, dotted reserved names, superscript device-name variants, and missing-episode-title regressions.
 - `cargo clippy --all-targets --all-features --locked -- -D warnings` — passed.
 - `cargo build --locked` — passed.
 - `cargo build --locked --all-features` — passed.

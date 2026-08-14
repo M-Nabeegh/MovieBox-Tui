@@ -222,6 +222,37 @@ fn dotted_windows_reserved_names_are_safe_components() {
 }
 
 #[test]
+fn superscript_windows_device_names_are_safe_components() {
+    let (_temp, namer) = namer();
+
+    let com_paths = namer
+        .paths_for(
+            &MediaIdentity::from_details(&movie("COM¹.txt", "2024"), None, None).unwrap(),
+            "mkv",
+            None,
+            Uuid::nil(),
+        )
+        .unwrap();
+    assert_eq!(
+        com_paths.video_relative,
+        PathBuf::from("Movies/COM¹_.txt (2024)/COM¹_.txt (2024).mkv")
+    );
+
+    let lpt_paths = namer
+        .paths_for(
+            &MediaIdentity::from_details(&movie("LPT².log", "2024"), None, None).unwrap(),
+            "mkv",
+            None,
+            Uuid::nil(),
+        )
+        .unwrap();
+    assert_eq!(
+        lpt_paths.video_relative,
+        PathBuf::from("Movies/LPT²_.log (2024)/LPT²_.log (2024).mkv")
+    );
+}
+
+#[test]
 fn canonically_equivalent_titles_and_languages_generate_identical_paths() {
     let (_temp, namer) = namer();
     let precomposed = MediaIdentity::from_details(&movie("Café", "2024"), None, None).unwrap();
