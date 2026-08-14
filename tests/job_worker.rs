@@ -40,13 +40,19 @@ const DEFAULT_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[derive(Clone)]
 struct MockCatalog {
     resolutions: Arc<Mutex<VecDeque<Result<ResolvedSource, CatalogError>>>>,
+    resolves: Arc<AtomicUsize>,
 }
 
 impl MockCatalog {
     fn new(values: impl IntoIterator<Item = Result<ResolvedSource, CatalogError>>) -> Self {
         Self {
             resolutions: Arc::new(Mutex::new(values.into_iter().collect())),
+            resolves: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn resolve_count(&self) -> usize {
+        self.resolves.load(Ordering::Relaxed)
     }
 }
 
@@ -73,6 +79,7 @@ impl CatalogProvider for MockCatalog {
         _source: &SourceId,
         _subtitle: Option<&SubtitleId>,
     ) -> Result<ResolvedSource, CatalogError> {
+        self.resolves.fetch_add(1, Ordering::Relaxed);
         self.resolutions
             .lock()
             .await
@@ -438,7 +445,7 @@ async fn insufficient_space_event_is_sanitized() {
 }
 
 #[tokio::test]
-async fn low_disk_run_backs_off_after_defer() {
+async fn low_disk_run_stops_after_defer() {
     let harness = WorkerHarness::new();
     let server = FixtureServer::start(8 * 1024).await.unwrap();
     let job = build_job(&harness.media_root, "backoff", JobState::Queued);
@@ -450,42 +457,32 @@ async fn low_disk_run_backs_off_after_defer() {
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
     });
-    let catalog = Arc::new(MockCatalog::new([
-        resolved.clone(),
-        resolved.clone(),
-        resolved.clone(),
-        resolved,
-    ]));
+    let catalog = Arc::new(MockCatalog::new([resolved]));
     let bus = JobEventBus::new(16);
     let mut events = bus.subscribe();
     let worker = harness.worker(
         store.clone(),
-        catalog,
+        catalog.clone(),
         moviebox_tui::server::jobs::HttpTransferClient::new(server.client()),
         bus,
         Arc::new(MockDiskSpace::new(DEFAULT_RESERVE_BYTES)),
     );
-    let cancel = CancellationToken::new();
-    let running = tokio::spawn({
-        let worker = worker.clone();
-        let cancel = cancel.clone();
-        async move { worker.run(cancel).await }
-    });
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        worker.run(CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    cancel.cancel();
-    running.await.unwrap().unwrap();
-
-    let mut event_count = 0;
-    while events.try_recv().is_ok() {
-        event_count += 1;
-    }
-    assert!(
-        store.claim_count() <= 3,
-        "too many claims: {}",
-        store.claim_count()
-    );
-    assert!(event_count <= 4, "too many events: {event_count}");
+    assert_eq!(store.claim_count(), 1);
+    assert_eq!(catalog.resolve_count(), 1);
+    let requeued = store.job(job.id).await;
+    assert_eq!(requeued.state, JobState::Queued);
+    assert_eq!(requeued.error_code.as_deref(), Some("insufficient_space"));
+    assert!(events.try_recv().is_ok(), "expected a claimed event");
+    assert!(events.try_recv().is_ok(), "expected a safe space event");
+    assert!(events.try_recv().is_err(), "expected no repeated events");
 }
 
 #[tokio::test]

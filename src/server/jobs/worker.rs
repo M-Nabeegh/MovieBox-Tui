@@ -314,7 +314,8 @@ where
 
             match self.run_once().await? {
                 WorkerRunOutcome::Progressed => continue,
-                WorkerRunOutcome::NoJob | WorkerRunOutcome::Deferred => {}
+                WorkerRunOutcome::Deferred => return Ok(()),
+                WorkerRunOutcome::NoJob => {}
             }
 
             tokio::select! {

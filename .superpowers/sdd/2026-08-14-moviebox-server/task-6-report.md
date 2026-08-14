@@ -11,7 +11,7 @@ Implemented and hardened a small Task 6 vertical slice for the server download q
 - Implemented a single-worker claim/resolve/download/finalize flow that reuses `CatalogProvider`, `DownloadRequest`, `DownloadClient`, and `LibraryNamer`.
 - Download into the UUID-scoped partial area first, then atomically rename into the final library path before marking the job `ready`.
 - Enforced a reserve-space check before transfer and requeued jobs with `insufficient_space` without contacting the remote media URL.
-- Added an explicit `WorkerRunOutcome`; low-space requeues return `Deferred`, and `run()` backs off instead of immediately reclaiming the same job.
+- Added an explicit `WorkerRunOutcome`; low-space requeues return `Deferred`, and `run()` stops after that one attempt instead of sleeping and reclaiming the same job. A later server wake/restart can start it again.
 - Enforced the exact `_moviebox/jobs/<job-id>/<name>.part` layout for video and subtitle partial paths before recovery, transfer, and finalization. Invalid queued/recovered jobs fail with the generic `unsafe_path` code.
 - Recovery only promotes a `finalizing` job to `ready` when `total_bytes` is recorded and the final file length matches it exactly; unknown-size final files are requeued conservatively.
 - Added a single refresh retry for expired transfer URLs and kept failure messages generic so provider URLs, tokens, and raw paths do not leak.
@@ -19,7 +19,7 @@ Implemented and hardened a small Task 6 vertical slice for the server download q
 - Wired the new worker/recovery exports through `src/server/jobs/mod.rs`.
 - Kept the existing repository scaffold and completed its Task 6 dependency on `JobStatePatch`.
 - Removed the misleading public pause/cancel/retry controls and dormant deletion path from this MVP; those controls require a separately specified lifecycle/API slice.
-- Reduced `tests/job_worker.rs` to six local proofs: restart recovery, conservative unknown-size recovery, one successful completion, bounded low-space backoff, forged in-root partial rejection, and sanitized insufficient-space events.
+- Reduced `tests/job_worker.rs` to six local proofs: restart recovery, conservative unknown-size recovery, one successful completion, one-attempt low-space stop with one claim/resolve, forged in-root partial rejection, and sanitized insufficient-space events.
 - Added `#![allow(dead_code)]` to `tests/support/http_server.rs` because the trimmed worker slice no longer exercises every helper in that shared fixture server.
 
 ## Checks
