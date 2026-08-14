@@ -11,5 +11,5 @@ pub use recovery::recover_interrupted_jobs;
 pub use repository::JobRepository;
 pub use worker::{
     DiskSpaceChecker, HttpTransferClient, JobStatePatch, JobStore, JobWorker, TransferClient,
-    TransferError, TransferProgress,
+    TransferError, TransferProgress, WorkerRunOutcome,
 };

@@ -6,7 +6,11 @@ mod support;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -19,7 +23,7 @@ use moviebox_tui::{
         events::JobEventBus,
         jobs::{
             DownloadJob, JobEvent, JobEventKind, JobId, JobProgress, JobRepositoryError, JobState,
-            JobStatePatch, JobStore, JobWorker, recover_interrupted_jobs,
+            JobStatePatch, JobStore, JobWorker, WorkerRunOutcome, recover_interrupted_jobs,
         },
         library::LibraryNamer,
     },
@@ -28,6 +32,7 @@ use support::http_server::FixtureServer;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::{fs, sync::Mutex};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DEFAULT_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -97,6 +102,7 @@ impl moviebox_tui::server::jobs::DiskSpaceChecker for MockDiskSpace {
 #[derive(Debug, Clone, Default)]
 struct MockStore {
     jobs: Arc<Mutex<HashMap<JobId, DownloadJob>>>,
+    claims: Arc<AtomicUsize>,
 }
 
 impl MockStore {
@@ -104,7 +110,12 @@ impl MockStore {
         let jobs = jobs.into_iter().map(|job| (job.id, job)).collect();
         Self {
             jobs: Arc::new(Mutex::new(jobs)),
+            claims: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn claim_count(&self) -> usize {
+        self.claims.load(Ordering::Relaxed)
     }
 
     async fn job(&self, id: JobId) -> DownloadJob {
@@ -120,6 +131,7 @@ impl MockStore {
 #[async_trait]
 impl JobStore for MockStore {
     async fn claim_next(&self) -> Result<Option<DownloadJob>, JobRepositoryError> {
+        self.claims.fetch_add(1, Ordering::Relaxed);
         let mut jobs = self.jobs.lock().await;
         let next_id = jobs
             .values()
@@ -358,7 +370,10 @@ async fn worker_completes_one_job_and_finalizes_into_the_library() {
         )),
     );
 
-    assert!(worker.run_once().await.unwrap());
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        WorkerRunOutcome::Progressed
+    );
 
     let completed = store.job(job.id).await;
     assert_eq!(completed.state, JobState::Ready);
@@ -399,7 +414,7 @@ async fn insufficient_space_event_is_sanitized() {
         Arc::new(MockDiskSpace::new(DEFAULT_RESERVE_BYTES)),
     );
 
-    assert!(worker.run_once().await.unwrap());
+    assert_eq!(worker.run_once().await.unwrap(), WorkerRunOutcome::Deferred);
 
     let requeued = store.job(job.id).await;
     assert_eq!(requeued.state, JobState::Queued);
@@ -420,4 +435,104 @@ async fn insufficient_space_event_is_sanitized() {
     }
 
     assert!(saw_space_error, "expected an insufficient_space event");
+}
+
+#[tokio::test]
+async fn low_disk_run_backs_off_after_defer() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let job = build_job(&harness.media_root, "backoff", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let resolved = Ok(ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: Some(server.content_len() as u64),
+    });
+    let catalog = Arc::new(MockCatalog::new([
+        resolved.clone(),
+        resolved.clone(),
+        resolved.clone(),
+        resolved,
+    ]));
+    let bus = JobEventBus::new(16);
+    let mut events = bus.subscribe();
+    let worker = harness.worker(
+        store.clone(),
+        catalog,
+        moviebox_tui::server::jobs::HttpTransferClient::new(server.client()),
+        bus,
+        Arc::new(MockDiskSpace::new(DEFAULT_RESERVE_BYTES)),
+    );
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn({
+        let worker = worker.clone();
+        let cancel = cancel.clone();
+        async move { worker.run(cancel).await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    cancel.cancel();
+    running.await.unwrap().unwrap();
+
+    let mut event_count = 0;
+    while events.try_recv().is_ok() {
+        event_count += 1;
+    }
+    assert!(
+        store.claim_count() <= 3,
+        "too many claims: {}",
+        store.claim_count()
+    );
+    assert!(event_count <= 4, "too many events: {event_count}");
+}
+
+#[tokio::test]
+async fn forged_in_root_partial_path_fails_without_touching_file() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let mut job = build_job(&harness.media_root, "forged", JobState::Queued);
+    job.partial_video_path = "Movies/forged.mkv.part".to_string();
+    let forged = harness.media_root.join(&job.partial_video_path);
+    fs::create_dir_all(forged.parent().unwrap()).await.unwrap();
+    fs::write(&forged, b"do-not-touch").await.unwrap();
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let worker = harness.worker(
+        store.clone(),
+        Arc::new(MockCatalog::new([])),
+        moviebox_tui::server::jobs::HttpTransferClient::new(server.client()),
+        JobEventBus::new(16),
+        Arc::new(MockDiskSpace::new(u64::MAX)),
+    );
+
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        WorkerRunOutcome::Progressed
+    );
+
+    let failed = store.job(job.id).await;
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("unsafe_path"));
+    assert_eq!(fs::read(&forged).await.unwrap(), b"do-not-touch");
+}
+
+#[tokio::test]
+async fn recovery_requeues_finalizing_job_without_recorded_size() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "unknown-size", JobState::Finalizing);
+    let final_path = harness.media_root.join(&job.final_video_path);
+    fs::create_dir_all(final_path.parent().unwrap())
+        .await
+        .unwrap();
+    fs::write(&final_path, b"present-but-unverified")
+        .await
+        .unwrap();
+    let store = MockStore::with_jobs([job.clone()]);
+
+    recover_interrupted_jobs(&store, harness.namer.media_root())
+        .await
+        .unwrap();
+
+    assert_eq!(store.job(job.id).await.state, JobState::Queued);
 }

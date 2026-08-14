@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     DownloadJob, JobEvent, JobEventKind, JobId, JobProgress, JobRepository, JobRepositoryError,
     JobState,
-    recovery::{clear_job_errors, fail_job},
+    recovery::{fail_job, validate_job_partial_path},
 };
 use crate::{
     catalog::{CatalogError, CatalogProvider, QualityPolicy, ResolvedSource, SubtitleId},
@@ -230,24 +230,19 @@ impl JobStore for JobRepository {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveCommand {
-    Pause,
-    Cancel,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveJob {
-    token: CancellationToken,
-    command: ActiveCommand,
-}
-
 #[derive(Debug, Error)]
 pub enum WorkerError {
     #[error(transparent)]
     Repository(#[from] JobRepositoryError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerRunOutcome {
+    NoJob,
+    Progressed,
+    Deferred,
 }
 
 #[derive(Clone)]
@@ -259,7 +254,6 @@ pub struct JobWorker<S, C, T, D = SystemDiskSpaceChecker> {
     bus: JobEventBus,
     disk: Arc<D>,
     reserve_bytes: u64,
-    active: Arc<Mutex<HashMap<JobId, ActiveJob>>>,
     throttled_warnings: Arc<Mutex<HashMap<JobId, Instant>>>,
 }
 
@@ -284,7 +278,6 @@ where
             bus,
             disk: Arc::new(SystemDiskSpaceChecker),
             reserve_bytes: DEFAULT_RESERVE_BYTES,
-            active: Arc::new(Mutex::new(HashMap::new())),
             throttled_warnings: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -309,7 +302,6 @@ where
             bus: self.bus,
             disk,
             reserve_bytes: self.reserve_bytes,
-            active: self.active,
             throttled_warnings: self.throttled_warnings,
         }
     }
@@ -320,8 +312,9 @@ where
                 return Ok(());
             }
 
-            if self.run_once().await? {
-                continue;
+            match self.run_once().await? {
+                WorkerRunOutcome::Progressed => continue,
+                WorkerRunOutcome::NoJob | WorkerRunOutcome::Deferred => {}
             }
 
             tokio::select! {
@@ -331,73 +324,17 @@ where
         }
     }
 
-    pub async fn run_once(&self) -> Result<bool, WorkerError> {
+    pub async fn run_once(&self) -> Result<WorkerRunOutcome, WorkerError> {
         let Some(job) = self.store.claim_next().await? else {
-            return Ok(false);
+            return Ok(WorkerRunOutcome::NoJob);
         };
 
         self.publish(&job, JobEventKind::Claimed);
 
-        self.process_claimed_job(job).await?;
-
-        Ok(true)
+        self.process_claimed_job(job).await
     }
 
-    pub async fn pause(&self, id: JobId) -> Result<(), JobRepositoryError> {
-        let mut active = self.active.lock().await;
-        if let Some(job) = active.get_mut(&id) {
-            job.command = ActiveCommand::Pause;
-            job.token.cancel();
-        }
-        Ok(())
-    }
-
-    pub async fn cancel(&self, id: JobId) -> Result<(), JobRepositoryError> {
-        let mut active = self.active.lock().await;
-        if let Some(job) = active.get_mut(&id) {
-            job.command = ActiveCommand::Cancel;
-            job.token.cancel();
-        } else {
-            let current = self.store.get(id).await?;
-            match current.state {
-                JobState::Queued | JobState::Paused => {
-                    let next = self
-                        .store
-                        .transition(
-                            id,
-                            current.version,
-                            JobState::Cancelled,
-                            Some(JobEvent::new(JobEventKind::StateChanged)),
-                        )
-                        .await?;
-                    self.remove_job_files(&next)
-                        .await
-                        .map_err(|error| JobRepositoryError::InvalidData(error.to_string()))?;
-                    self.publish(&next, JobEventKind::StateChanged);
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn retry(&self, id: JobId) -> Result<DownloadJob, JobRepositoryError> {
-        let current = self.store.get(id).await?;
-        let retried = self
-            .store
-            .force_state(
-                id,
-                current.version,
-                JobState::Queued,
-                JobEventKind::StateChanged,
-                clear_job_errors(),
-            )
-            .await?;
-        self.publish(&retried, JobEventKind::StateChanged);
-        Ok(retried)
-    }
-
-    async fn process_claimed_job(&self, job: DownloadJob) -> Result<(), WorkerError> {
+    async fn process_claimed_job(&self, job: DownloadJob) -> Result<WorkerRunOutcome, WorkerError> {
         if !self.paths_are_safe(&job) {
             fail_job(
                 self.store.as_ref(),
@@ -409,7 +346,7 @@ where
             .await?;
             let failed = self.store.get(job.id).await?;
             self.publish(&failed, JobEventKind::StateChanged);
-            return Ok(());
+            return Ok(WorkerRunOutcome::Progressed);
         }
 
         let resolve = self
@@ -428,7 +365,7 @@ where
                 )
                 .await?;
                 self.publish(&self.store.get(job.id).await?, JobEventKind::StateChanged);
-                return Ok(());
+                return Ok(WorkerRunOutcome::Progressed);
             }
             Err(_) => {
                 fail_job(
@@ -440,7 +377,7 @@ where
                 )
                 .await?;
                 self.publish(&self.store.get(job.id).await?, JobEventKind::StateChanged);
-                return Ok(());
+                return Ok(WorkerRunOutcome::Progressed);
             }
         };
 
@@ -460,7 +397,7 @@ where
             )
             .await?;
             self.publish(&self.store.get(job.id).await?, JobEventKind::StateChanged);
-            return Ok(());
+            return Ok(WorkerRunOutcome::Progressed);
         }
 
         let available = self.disk.available_bytes(self.namer.media_root()).await?;
@@ -483,7 +420,7 @@ where
             if self.should_emit_warning(job.id).await {
                 self.publish(&requeued, JobEventKind::StateChanged);
             }
-            return Ok(());
+            return Ok(WorkerRunOutcome::Deferred);
         }
 
         let downloading = self
@@ -500,7 +437,7 @@ where
         let download = self.download_with_refresh(downloading, resolved).await?;
         let completed = match download {
             Some(job) => job,
-            None => return Ok(()),
+            None => return Ok(WorkerRunOutcome::Progressed),
         };
 
         let mut finalized = self
@@ -554,7 +491,7 @@ where
             )
             .await?;
         self.publish(&ready, JobEventKind::StateChanged);
-        Ok(())
+        Ok(WorkerRunOutcome::Progressed)
     }
 
     async fn download_with_refresh(
@@ -562,6 +499,7 @@ where
         downloading: DownloadJob,
         mut resolved: ResolvedSource,
     ) -> Result<Option<DownloadJob>, WorkerError> {
+        self.validated_partial_path(&downloading, &downloading.partial_video_path)?;
         let video_destination =
             active_transfer_path(&downloading.partial_video_path).ok_or_else(|| {
                 JobRepositoryError::InvalidData("partial video path must end with .part".into())
@@ -575,23 +513,15 @@ where
         loop {
             attempts += 1;
             let token = CancellationToken::new();
-            self.active.lock().await.insert(
-                downloading.id,
-                ActiveJob {
-                    token: token.clone(),
-                    command: ActiveCommand::Pause,
-                },
-            );
 
             let request = build_request(&resolved);
             let outcome = self
                 .run_transfer(downloading.clone(), request, &absolute_destination, token)
                 .await;
-            self.active.lock().await.remove(&downloading.id);
 
             match outcome {
                 Ok(TransferOutcome::Completed(job)) => return Ok(Some(job)),
-                Ok(TransferOutcome::Paused(job, ActiveCommand::Pause)) => {
+                Ok(TransferOutcome::Paused(job)) => {
                     let paused = self
                         .store
                         .transition(
@@ -602,20 +532,6 @@ where
                         )
                         .await?;
                     self.publish(&paused, JobEventKind::StateChanged);
-                    return Ok(None);
-                }
-                Ok(TransferOutcome::Paused(job, ActiveCommand::Cancel)) => {
-                    self.remove_job_files(&job).await?;
-                    let cancelled = self
-                        .store
-                        .transition(
-                            job.id,
-                            job.version,
-                            JobState::Cancelled,
-                            Some(JobEvent::new(JobEventKind::StateChanged)),
-                        )
-                        .await?;
-                    self.publish(&cancelled, JobEventKind::StateChanged);
                     return Ok(None);
                 }
                 Err(TransferError::Download(DownloadError::Http(status)))
@@ -754,14 +670,7 @@ where
                                 )
                                 .await
                                 .map_err(map_repo_as_io)?;
-                            let command = self
-                                .active
-                                .lock()
-                                .await
-                                .get(&paused.id)
-                                .map(|job| job.command)
-                                .unwrap_or(ActiveCommand::Pause);
-                            Ok(TransferOutcome::Paused(paused, command))
+                            Ok(TransferOutcome::Paused(paused))
                         }
                     };
                 }
@@ -770,6 +679,7 @@ where
     }
 
     async fn finalize_video(&self, job: &DownloadJob) -> Result<(), WorkerError> {
+        self.validated_partial_path(job, &job.partial_video_path)?;
         let source =
             self.contained_path(&active_transfer_path(&job.partial_video_path).ok_or_else(
                 || JobRepositoryError::InvalidData("partial video path must end with .part".into()),
@@ -796,6 +706,8 @@ where
         let Some(final_subtitle) = &job.final_subtitle_path else {
             return Ok(None);
         };
+
+        self.validated_partial_path(job, partial)?;
 
         let resolved = match self
             .catalog
@@ -858,8 +770,7 @@ where
     fn paths_are_safe(&self, job: &DownloadJob) -> bool {
         self.contained_path(Path::new(&job.final_video_path))
             .is_ok()
-            && self
-                .contained_path(Path::new(&job.partial_video_path))
+            && validate_job_partial_path(self.namer.media_root(), job.id, &job.partial_video_path)
                 .is_ok()
             && job
                 .final_subtitle_path
@@ -869,34 +780,24 @@ where
             && job
                 .partial_subtitle_path
                 .as_ref()
-                .map(|path| self.contained_path(Path::new(path)).is_ok())
+                .map(|path| {
+                    validate_job_partial_path(self.namer.media_root(), job.id, path).is_ok()
+                })
                 .unwrap_or(true)
+    }
+
+    fn validated_partial_path(
+        &self,
+        job: &DownloadJob,
+        partial_relative: &str,
+    ) -> Result<PathBuf, WorkerError> {
+        validate_job_partial_path(self.namer.media_root(), job.id, partial_relative)
+            .map_err(|_| WorkerError::Io(std::io::Error::other("unsafe partial path")))
     }
 
     fn contained_path(&self, relative: &Path) -> Result<PathBuf, WorkerError> {
         contained_path(self.namer.media_root(), relative)
             .map_err(|error| WorkerError::Io(std::io::Error::other(error.to_string())))
-    }
-
-    async fn remove_job_files(&self, job: &DownloadJob) -> Result<(), WorkerError> {
-        self.remove_transfer_artifacts(&job.partial_video_path)
-            .await?;
-        if let Some(path) = &job.partial_subtitle_path {
-            self.remove_transfer_artifacts(path).await?;
-        }
-        Ok(())
-    }
-
-    async fn remove_transfer_artifacts(&self, partial_relative: &str) -> Result<(), WorkerError> {
-        let partial = self.contained_path(Path::new(partial_relative))?;
-        remove_if_exists(&partial).await?;
-        remove_if_exists(Path::new(&format!("{}.json", partial.display()))).await?;
-
-        if let Some(active) = active_transfer_path(partial_relative) {
-            let active = self.contained_path(&active)?;
-            remove_if_exists(&active).await?;
-        }
-        Ok(())
     }
 
     async fn should_emit_warning(&self, job_id: JobId) -> bool {
@@ -918,7 +819,7 @@ where
 
 enum TransferOutcome {
     Completed(DownloadJob),
-    Paused(DownloadJob, ActiveCommand),
+    Paused(DownloadJob),
 }
 
 fn build_request(resolved: &ResolvedSource) -> DownloadRequest {
@@ -942,12 +843,4 @@ fn is_expired_status(status: StatusCode) -> bool {
 
 fn map_repo_as_io(error: JobRepositoryError) -> TransferError {
     TransferError::Io(std::io::Error::other(error.to_string()))
-}
-
-async fn remove_if_exists(path: &Path) -> Result<(), WorkerError> {
-    match fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(WorkerError::Io(error)),
-    }
 }
