@@ -1,0 +1,38 @@
+{
+  "subjectId": "subject-fixture-2",
+  "list": [
+    {
+      "resourceId": "resource-fixture-2160",
+      "resourceLink": "https://stream.fixtures.invalid/video-2160.mkv",
+      "resolution": 2160,
+      "size": "7516192768",
+      "sizeBytes": 7516192768,
+      "codecName": "h265",
+      "lanName": "Original",
+      "se": 1,
+      "ep": 2
+    },
+    {
+      "resourceId": "resource-fixture-1080",
+      "resourceLink": "https://stream.fixtures.invalid/video-1080.mkv",
+      "resolution": 1080,
+      "size": "2147483648",
+      "sizeBytes": 2147483648,
+      "codecName": "h264",
+      "lanName": "Original",
+      "se": 1,
+      "ep": 2
+    },
+    {
+      "resourceId": "resource-fixture-720",
+      "resourceLink": "https://stream.fixtures.invalid/video-720.mkv",
+      "resolution": 720,
+      "size": "1073741824",
+      "sizeBytes": 1073741824,
+      "codecName": "h264",
+      "lanName": "English Dub",
+      "se": 1,
+      "ep": 2
+    }
+  ]
+}

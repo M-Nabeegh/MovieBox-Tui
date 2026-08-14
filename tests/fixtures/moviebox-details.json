@@ -1,0 +1,39 @@
+{
+  "subjectId": "subject-fixture-2",
+  "title": "Fixture Series [Hindi]",
+  "subjectType": 2,
+  "releaseDate": "2023",
+  "description": "A deterministic fixture synopsis for the server catalog tests.",
+  "tagline": "Fixtures stay boring on purpose.",
+  "imdbRatingValue": "8.4",
+  "duration": "45m",
+  "genre": ["Sci-Fi", "Drama"],
+  "countryName": "Fixtureland",
+  "poster": {
+    "url": "https://images.fixtures.invalid/poster-fixture-2.jpg"
+  },
+  "dubs": [
+    {
+      "subjectId": "subject-fixture-2",
+      "lanName": "Original"
+    },
+    {
+      "subjectId": "subject-fixture-2-dub-hi",
+      "lanName": "Hindi Dub"
+    }
+  ],
+  "seasons": {
+    "seasons": [
+      {
+        "se": 1,
+        "maxEp": 3,
+        "allEp": "1,2,3"
+      },
+      {
+        "se": 2,
+        "maxEp": 2,
+        "allEp": "1,2"
+      }
+    ]
+  }
+}

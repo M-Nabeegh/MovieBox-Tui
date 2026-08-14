@@ -1,0 +1,16 @@
+{
+  "subjectId": "subject-fixture-2",
+  "resourceId": "resource-fixture-1080",
+  "extCaptions": [
+    {
+      "lanName": "English",
+      "url": "https://subs.fixtures.invalid/resource-fixture-1080.en.srt",
+      "format": "srt"
+    },
+    {
+      "lanName": "Urdu",
+      "url": "https://subs.fixtures.invalid/resource-fixture-1080.ur.vtt",
+      "format": "vtt"
+    }
+  ]
+}

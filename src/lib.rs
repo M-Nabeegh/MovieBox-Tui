@@ -6,4 +6,7 @@ pub mod providers;
 pub mod tui;
 
 #[cfg(feature = "server")]
+pub mod catalog;
+
+#[cfg(feature = "server")]
 pub mod server;

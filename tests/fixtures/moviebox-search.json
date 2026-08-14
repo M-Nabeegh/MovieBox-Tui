@@ -1,0 +1,36 @@
+{
+  "results": [
+    {
+      "subjects": [
+        {
+          "subjectId": "subject-fixture-1",
+          "title": "Fixture Movie [English]",
+          "subjectType": 1,
+          "releaseDate": "2024",
+          "poster": {
+            "url": "https://images.fixtures.invalid/poster-fixture-1.jpg"
+          },
+          "resourceDetectors": [
+            {
+              "totalEpisode": 1
+            }
+          ]
+        },
+        {
+          "subjectId": "subject-fixture-2",
+          "title": "Fixture Series S01 [Hindi]",
+          "subjectType": 2,
+          "releaseDate": "2023",
+          "cover": {
+            "url": "https://images.fixtures.invalid/poster-fixture-2.jpg"
+          },
+          "resourceDetectors": [
+            {
+              "totalEpisode": 8
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
