@@ -55,7 +55,7 @@ fi
 
 mkdir -p "$backup_dir"
 backup_file="$backup_dir/serve-config-$(date -u +%Y%m%dT%H%M%SZ).json"
-if ! "$tailscale_bin" serve get-config >"$backup_file"; then
+if ! "$tailscale_bin" serve get-config "$backup_file" --all; then
   rm -f "$backup_file"
   printf 'error: could not capture the existing Tailscale Serve configuration\n' >&2
   exit 1

@@ -12,7 +12,7 @@ set -eu
 printf '%s\n' "$*" >>"$CALLS_FILE"
 case "$*" in
   "serve status --json") cat "$STATUS_JSON" ;;
-  "serve get-config") printf '%s\n' '{"TCP":{}}' ;;
+  "serve get-config "*) printf '%s\n' '{"TCP":{}}' >"$3" ;;
   *) : ;;
 esac
 EOF
@@ -44,6 +44,18 @@ teardown() {
   [ "$status" -eq 0 ]
   [ "$output" = "serve status --json" ]
   [ ! -d "$TAILSCALE_BACKUP_DIR" ]
+}
+
+@test "apply mode saves all Serve services with the current CLI syntax" {
+  printf '%s\n' '{"TCP":{}}' >"$STATUS_JSON"
+
+  run deploy/tailscale/moviebox-serve.sh
+
+  [ "$status" -eq 0 ]
+  run cat "$calls_file"
+  [[ "$output" == *"serve get-config "* ]]
+  [[ "$output" == *" --all"* ]]
+  [ -s "$TAILSCALE_BACKUP_DIR"/serve-config-*.json ]
 }
 
 @test "apply mode refuses to replace an unrelated existing Serve handler" {
