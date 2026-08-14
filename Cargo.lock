@@ -2213,6 +2213,7 @@ dependencies = [
  "tokio-stream",
  "tower-http",
  "tracing",
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
  "url",

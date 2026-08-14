@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
@@ -10,6 +11,9 @@ use crate::{
 };
 
 const MAX_COMPONENT_GRAPHEMES: usize = 120;
+const MAX_COMPONENT_BYTES: usize = 255;
+const MAX_LANGUAGE_GRAPHEMES: usize = 48;
+const MAX_LANGUAGE_BYTES: usize = 230;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaIdentity {
@@ -45,7 +49,7 @@ impl MediaIdentity {
             MediaType::Series => {
                 let season = season.ok_or(LibraryError::MissingEpisodeSelection)?;
                 let episode = episode.ok_or(LibraryError::MissingEpisodeSelection)?;
-                let episode_title = details
+                let episode_info = details
                     .seasons
                     .iter()
                     .find(|candidate| candidate.number == season)
@@ -54,7 +58,6 @@ impl MediaIdentity {
                             .episodes
                             .iter()
                             .find(|item| item.number == episode)
-                            .and_then(|item| item.title.clone())
                     })
                     .ok_or(LibraryError::EpisodeNotFound { season, episode })?;
                 Ok(Self::Episode {
@@ -62,7 +65,7 @@ impl MediaIdentity {
                     year: details.year.clone(),
                     season,
                     episode,
-                    episode_title: Some(episode_title),
+                    episode_title: episode_info.title.clone(),
                 })
             }
         }
@@ -91,6 +94,8 @@ pub enum LibraryError {
     UnsupportedSubtitleExtension(String),
     #[error("completed media target already exists: {relative_path}")]
     AlreadyExists { relative_path: PathBuf },
+    #[error("path component exceeds {MAX_COMPONENT_BYTES} bytes: {relative_path}")]
+    ComponentTooLong { relative_path: PathBuf },
     #[error("path validation failed: {0}")]
     Path(#[from] PathSecurityError),
 }
@@ -129,10 +134,11 @@ impl LibraryNamer {
                 ))
             })
             .transpose()?;
+        let max_stem_bytes = filename_stem_byte_limit(&video_extension, subtitle.as_ref());
 
         let (video_relative, subtitle_relative, stem) = match identity {
             MediaIdentity::Movie { title, year } => {
-                let display = display_title(title, year.as_deref());
+                let display = display_title(title, year.as_deref(), max_stem_bytes);
                 let folder = PathBuf::from("Movies").join(&display);
                 let stem = display;
                 let video = folder.join(format!("{stem}.{video_extension}"));
@@ -148,11 +154,17 @@ impl LibraryNamer {
                 episode,
                 episode_title,
             } => {
-                let show = display_title(series_title, year.as_deref());
+                let show = display_title(series_title, year.as_deref(), MAX_COMPONENT_BYTES);
                 let folder = PathBuf::from("Shows")
                     .join(&show)
                     .join(format!("Season {season:02}"));
-                let stem = episode_stem(&show, *season, *episode, episode_title.as_deref());
+                let stem = episode_stem(
+                    &show,
+                    *season,
+                    *episode,
+                    episode_title.as_deref(),
+                    max_stem_bytes,
+                );
                 let video = folder.join(format!("{stem}.{video_extension}"));
                 let subtitle = subtitle.as_ref().map(|(language, extension)| {
                     folder.join(format!("{stem}.{language}.{extension}"))
@@ -204,6 +216,14 @@ impl LibraryNamer {
     }
 
     fn validate_relative_path(&self, relative: &Path) -> Result<PathBuf, LibraryError> {
+        if relative.components().any(|component| {
+            matches!(component, std::path::Component::Normal(value)
+                if value.to_string_lossy().len() > MAX_COMPONENT_BYTES)
+        }) {
+            return Err(LibraryError::ComponentTooLong {
+                relative_path: relative.to_path_buf(),
+            });
+        }
         contained_path(&self.media_root, relative).map_err(Into::into)
     }
 }
@@ -232,23 +252,39 @@ fn normalize_subtitle_extension(value: &str) -> Result<String, LibraryError> {
 }
 
 fn normalize_extension(value: &str) -> String {
-    value.trim().trim_start_matches('.').to_ascii_lowercase()
+    value
+        .nfc()
+        .collect::<String>()
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
 }
 
-fn display_title(title: &str, year: Option<&str>) -> String {
+fn display_title(title: &str, year: Option<&str>, max_bytes: usize) -> String {
     let title = sanitize_component(title);
     let year = sanitize_year(year);
     match year {
-        Some(year) => truncate_with_suffix(&title, &format!(" ({year})"), MAX_COMPONENT_GRAPHEMES),
-        None => truncate_graphemes(&title, MAX_COMPONENT_GRAPHEMES),
+        Some(year) => truncate_with_suffix(
+            &title,
+            &format!(" ({year})"),
+            MAX_COMPONENT_GRAPHEMES,
+            max_bytes,
+        ),
+        None => truncate_component(&title, MAX_COMPONENT_GRAPHEMES, max_bytes),
     }
 }
 
-fn episode_stem(series: &str, season: u16, episode: u16, episode_title: Option<&str>) -> String {
+fn episode_stem(
+    series: &str,
+    season: u16,
+    episode: u16,
+    episode_title: Option<&str>,
+    max_bytes: usize,
+) -> String {
     let code = format!(" S{season:02}E{episode:02}");
     let reserved = count_graphemes(&code);
     let max_series = MAX_COMPONENT_GRAPHEMES.saturating_sub(reserved);
-    let series = truncate_graphemes(series, max_series);
+    let series = truncate_component(series, max_series, max_bytes.saturating_sub(code.len()));
     let prefix = format!("{series}{code}");
 
     match episode_title
@@ -260,10 +296,18 @@ fn episode_stem(series: &str, season: u16, episode: u16, episode_title: Option<&
             let available = MAX_COMPONENT_GRAPHEMES
                 .saturating_sub(count_graphemes(&prefix))
                 .saturating_sub(spacer);
-            if available == 0 {
+            let available_bytes = max_bytes
+                .saturating_sub(prefix.len())
+                .saturating_sub(spacer);
+            if available == 0 || available_bytes == 0 {
                 prefix
             } else {
-                format!("{prefix} {}", truncate_graphemes(&title, available))
+                let title = truncate_component(&title, available, available_bytes);
+                if title.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix} {title}")
+                }
             }
         }
         None => prefix,
@@ -287,10 +331,11 @@ fn sanitize_year(year: Option<&str>) -> Option<String> {
 
 fn sanitize_language(language: &str) -> String {
     let language = sanitize_component(language);
-    truncate_graphemes(&language, 48)
+    truncate_component(&language, MAX_LANGUAGE_GRAPHEMES, MAX_LANGUAGE_BYTES)
 }
 
 fn sanitize_component(value: &str) -> String {
+    let value = value.nfc().collect::<String>();
     let mut collapsed = String::new();
     let mut pending_space = false;
 
@@ -326,7 +371,11 @@ fn sanitize_component(value: &str) -> String {
     let component = if normalized_words.is_empty() {
         "Untitled".to_string()
     } else {
-        truncate_graphemes(&normalized_words, MAX_COMPONENT_GRAPHEMES)
+        truncate_component(
+            &normalized_words,
+            MAX_COMPONENT_GRAPHEMES,
+            MAX_COMPONENT_BYTES,
+        )
     };
 
     ensure_non_reserved(component)
@@ -370,27 +419,73 @@ fn ensure_non_reserved(mut component: String) -> String {
     component
 }
 
-fn truncate_with_suffix(value: &str, suffix: &str, limit: usize) -> String {
-    let suffix_len = count_graphemes(suffix);
-    if count_graphemes(value) + suffix_len <= limit {
+fn truncate_with_suffix(
+    value: &str,
+    suffix: &str,
+    max_graphemes: usize,
+    max_bytes: usize,
+) -> String {
+    let value = value.nfc().collect::<String>();
+    let suffix = suffix.nfc().collect::<String>();
+    let suffix_len = count_graphemes(&suffix);
+    if count_graphemes(&value) + suffix_len <= max_graphemes
+        && value.len() + suffix.len() <= max_bytes
+    {
         return format!("{value}{suffix}");
     }
 
-    let available = limit.saturating_sub(suffix_len);
-    let prefix = truncate_graphemes(value, available);
+    let available_graphemes = max_graphemes.saturating_sub(suffix_len);
+    let available_bytes = max_bytes.saturating_sub(suffix.len());
+    let prefix = truncate_component(&value, available_graphemes, available_bytes);
     if prefix.is_empty() {
-        truncate_graphemes(suffix, limit)
+        truncate_component(&suffix, max_graphemes, max_bytes)
     } else {
         format!("{prefix}{suffix}")
     }
 }
 
-fn truncate_graphemes(value: &str, limit: usize) -> String {
-    UnicodeSegmentation::graphemes(value, true)
-        .take(limit)
-        .collect::<String>()
+fn truncate_component(value: &str, max_graphemes: usize, max_bytes: usize) -> String {
+    let value = value.nfc().collect::<String>();
+    let mut truncated = String::new();
+
+    for grapheme in UnicodeSegmentation::graphemes(value.as_str(), true).take(max_graphemes) {
+        let available_bytes = max_bytes.saturating_sub(truncated.len());
+        if available_bytes == 0 {
+            break;
+        }
+        if grapheme.len() <= available_bytes {
+            truncated.push_str(grapheme);
+        } else if truncated.is_empty() {
+            truncated.push_str(truncate_to_utf8_bytes(grapheme, available_bytes));
+            break;
+        } else {
+            break;
+        }
+    }
+
+    truncated
         .trim_matches(|character| matches!(character, '.' | ' '))
         .to_string()
+}
+
+fn truncate_to_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn filename_stem_byte_limit(video_extension: &str, subtitle: Option<&(String, String)>) -> usize {
+    let video_partial_suffix_len = 1 + video_extension.len() + ".part".len();
+    let subtitle_partial_suffix_len = subtitle
+        .map(|(language, extension)| 1 + language.len() + 1 + extension.len() + ".part".len())
+        .unwrap_or(0);
+    MAX_COMPONENT_BYTES.saturating_sub(video_partial_suffix_len.max(subtitle_partial_suffix_len))
 }
 
 fn count_graphemes(value: &str) -> usize {
