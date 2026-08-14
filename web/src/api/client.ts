@@ -1,4 +1,4 @@
-import type { ApiRequestInit, ErrorEnvelope, Session } from "./types";
+import type { ApiRequestInit, ErrorEnvelope, Job, Session } from "./types";
 
 let csrfToken = "";
 let onUnauthorized: (() => void) | undefined;
@@ -27,5 +27,9 @@ export const api = {
     const session = await this.request<Session>("/auth/session", { retryOnAuth: false });
     csrfToken = session.csrf_token;
     return session;
+  },
+  jobs: {
+    list: () => api.request<Job[]>("/jobs"),
+    action: (id: string, action: "pause" | "resume" | "cancel" | "retry", version: number) => api.request<Job>(`/jobs/${encodeURIComponent(id)}/${action}`, { method: "POST", body: JSON.stringify({ version }) }),
   },
 };

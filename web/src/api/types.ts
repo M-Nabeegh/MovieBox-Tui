@@ -10,3 +10,6 @@ export type CatalogDetails = { id: string; title: string; media_type: MediaType;
 export type SourceOption = { id: string; height: number; label: string; size_bytes: number | null; language: string | null; recommended: boolean };
 export type SubtitleTrack = { id: string; language: string; format: string | null };
 export type CreateJobRequest = { catalog_id: string; source_id: string; subtitle_id: string | null; requested_height: number; season?: number; episode?: number };
+export type JobState = "queued" | "resolving" | "downloading" | "paused" | "finalizing" | "ready" | "failed" | "cancelled";
+export type Job = { id: string; catalog_id: string; source_id: string; subtitle_id: string | null; title: string; year: string | null; media_type: MediaType; season: number | null; episode: number | null; episode_title: string | null; requested_height: number; state: JobState; downloaded_bytes: number; total_bytes: number | null; speed_bytes_per_second: number | null; attempt: number; error_code: string | null; error_message: string | null; warning: string | null; version: number; updated_at?: string | null };
+export type JobUpdatedEvent = Pick<Job, "id" | "state" | "downloaded_bytes" | "total_bytes" | "speed_bytes_per_second" | "error_code" | "error_message" | "warning"> & { kind?: string; version?: number };
