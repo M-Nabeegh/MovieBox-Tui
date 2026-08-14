@@ -34,6 +34,14 @@ teardown() {
   [ "$status" -eq 0 ]
 }
 
+@test "jellyfin runs as the configured app user and render group" {
+  run jq -e '
+    .services.jellyfin.user == "1000:1000" and
+    (.services.jellyfin.group_add | index("993")) != null
+  ' "$rendered_config"
+  [ "$status" -eq 0 ]
+}
+
 @test "jellyfin receives read-only media and exactly one render GPU" {
   run jq -e '
     (.services.jellyfin.volumes | any(.[]; .target == "/media" and .read_only == true)) and

@@ -47,6 +47,9 @@ services:
 
   jellyfin:
     image: jellyfin/jellyfin:10.10.7
+    user: "${MOVIEBOX_UID}:${MOVIEBOX_GID}"
+    group_add:
+      - "${JELLYFIN_RENDER_GID}"
     restart: unless-stopped
     cap_drop:
       - ALL
