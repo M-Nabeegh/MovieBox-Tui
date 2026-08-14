@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod events;
 pub mod health;
 pub mod jobs;
+pub mod library;
 
 use axum::Router;
 
@@ -15,6 +16,7 @@ pub fn router(state: AppState) -> Router {
         .merge(auth::router())
         .merge(catalog::router())
         .merge(jobs::router())
+        .merge(library::router())
         .merge(events::router());
 
     // Task 8 extends this API surface with catalog, jobs, events, and library routes.

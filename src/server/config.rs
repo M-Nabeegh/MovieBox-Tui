@@ -108,6 +108,21 @@ impl ServerConfig {
             session_pepper,
         })
     }
+
+    pub fn read_jellyfin_api_key(&self) -> Result<Option<String>, ConfigError> {
+        self.jellyfin_api_key_file
+            .as_deref()
+            .map(|path| {
+                let key = fs::read_to_string(path)
+                    .map_err(|_| ConfigError::UnreadableSecret("MOVIEBOX_JELLYFIN_API_KEY_FILE"))?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return Err(ConfigError::EmptySecret("MOVIEBOX_JELLYFIN_API_KEY_FILE"));
+                }
+                Ok(key.to_string())
+            })
+            .transpose()
+    }
 }
 
 #[derive(Debug, Error)]
