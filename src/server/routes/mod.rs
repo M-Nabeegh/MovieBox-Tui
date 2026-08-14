@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod auth;
 pub mod catalog;
 pub mod events;
@@ -17,7 +18,10 @@ pub fn router(state: AppState) -> Router {
         .merge(events::router());
 
     // Task 8 extends this API surface with catalog, jobs, events, and library routes.
-    Router::new().nest("/api", api).with_state(state)
+    Router::new()
+        .nest("/api", api)
+        .merge(assets::router())
+        .with_state(state)
 }
 
 pub(crate) async fn session(

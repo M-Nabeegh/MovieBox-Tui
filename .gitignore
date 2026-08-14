@@ -19,3 +19,4 @@ Thumbs.db
 debug_*.json
 *.log
 dist/
+web/node_modules/
