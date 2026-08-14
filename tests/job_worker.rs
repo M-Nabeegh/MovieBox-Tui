@@ -19,11 +19,13 @@ use moviebox_tui::{
         CatalogDetails, CatalogError, CatalogId, CatalogProvider, EpisodeRequest, MediaType,
         ResolvedSource, SearchPage, SourceId, SourceOption, SubtitleId, SubtitleTrack,
     },
+    download::{DownloadOutcome, DownloadRequest},
     server::{
         events::JobEventBus,
         jobs::{
             DownloadJob, JobEvent, JobEventKind, JobId, JobProgress, JobRepositoryError, JobState,
-            JobStatePatch, JobStore, JobWorker, WorkerRunOutcome, recover_interrupted_jobs,
+            JobStatePatch, JobStore, JobWorker, TransferClient, TransferError, TransferProgress,
+            WorkerRunOutcome, recover_interrupted_jobs,
         },
         library::LibraryNamer,
     },
@@ -31,7 +33,10 @@ use moviebox_tui::{
 use support::http_server::FixtureServer;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::{fs, sync::Mutex};
+use tokio::{
+    fs,
+    sync::{Mutex, mpsc},
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -103,6 +108,31 @@ impl MockDiskSpace {
 impl moviebox_tui::server::jobs::DiskSpaceChecker for MockDiskSpace {
     async fn available_bytes(&self, _path: &Path) -> Result<u64, std::io::Error> {
         Ok(self.available)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailingTransfer;
+
+#[async_trait]
+impl TransferClient for FailingTransfer {
+    async fn transfer(
+        &self,
+        _request: DownloadRequest,
+        _destination: &Path,
+        _cancel: CancellationToken,
+        progress: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<DownloadOutcome, TransferError> {
+        progress
+            .send(TransferProgress {
+                downloaded_bytes: 1,
+                total_bytes: Some(10),
+                speed_bytes_per_second: Some(1),
+            })
+            .unwrap();
+        Err(TransferError::Io(std::io::Error::other(
+            "fixture transfer failure",
+        )))
     }
 }
 
@@ -396,6 +426,39 @@ async fn worker_completes_one_job_and_finalizes_into_the_library() {
             .join(&completed.partial_video_path)
             .exists()
     );
+}
+
+#[tokio::test]
+async fn transfer_failure_after_progress_does_not_stop_worker_on_version_conflict() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let job = build_job(&harness.media_root, "failure", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: Some(10),
+    })]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        WorkerRunOutcome::Progressed
+    );
+
+    let failed = store.job(job.id).await;
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.downloaded_bytes, 1);
+    assert_eq!(failed.error_code.as_deref(), Some("download_failed"));
 }
 
 #[tokio::test]

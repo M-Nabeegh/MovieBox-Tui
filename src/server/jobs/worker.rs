@@ -550,36 +550,24 @@ where
                     {
                         Ok(value) => value,
                         Err(_) => {
-                            fail_job(
-                                self.store.as_ref(),
+                            self.fail_current_job(
                                 downloading.id,
-                                downloading.version,
                                 "download_failed",
                                 "download request failed",
                             )
                             .await?;
-                            self.publish(
-                                &self.store.get(downloading.id).await?,
-                                JobEventKind::StateChanged,
-                            );
                             return Ok(None);
                         }
                     };
                 }
                 Err(error) => {
                     let _ = error;
-                    fail_job(
-                        self.store.as_ref(),
+                    self.fail_current_job(
                         downloading.id,
-                        downloading.version,
                         "download_failed",
                         "download request failed",
                     )
                     .await?;
-                    self.publish(
-                        &self.store.get(downloading.id).await?,
-                        JobEventKind::StateChanged,
-                    );
                     return Ok(None);
                 }
             }
@@ -816,6 +804,21 @@ where
                 true
             }
         }
+    }
+
+    async fn fail_current_job(
+        &self,
+        job_id: JobId,
+        code: &'static str,
+        message: &'static str,
+    ) -> Result<(), WorkerError> {
+        let current = self.store.get(job_id).await?;
+        if current.state != JobState::Downloading {
+            return Ok(());
+        }
+        fail_job(self.store.as_ref(), job_id, current.version, code, message).await?;
+        self.publish(&self.store.get(job_id).await?, JobEventKind::StateChanged);
+        Ok(())
     }
 
     fn publish(&self, job: &DownloadJob, kind: JobEventKind) {
