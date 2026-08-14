@@ -1,14 +1,14 @@
 #![cfg(feature = "server")]
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use moviebox_tui::{
     catalog::{CatalogId, MediaType, SourceId, SubtitleId},
     server::{
         db::connect,
         jobs::{
-            JobEvent, JobEventKind, JobProgress, JobRepository, JobRepositoryError, JobState,
-            NewJob,
+            JobEvent, JobEventKind, JobListCursor, JobProgress, JobRepository, JobRepositoryError,
+            JobState, NewJob,
         },
     },
 };
@@ -189,6 +189,21 @@ async fn migration_creates_tables_and_indexes() {
     assert!(names.contains(&"idx_sessions_expires_at".to_string()));
 }
 
+#[test]
+fn malformed_warning_is_rejected_without_panicking() {
+    let result = std::panic::catch_unwind(|| {
+        JobEvent::new(JobEventKind::StateChanged).with_warning("malformed\u{0}warning")
+    });
+
+    assert!(result.is_ok(), "malformed warning input must not panic");
+    let error = result.unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        JobRepositoryError::InvalidData(message)
+            if message == "text must not contain control characters"
+    ));
+}
+
 #[tokio::test]
 async fn create_persists_job_with_relative_paths_only() {
     let (_temp_dir, pool, repository) = test_repository().await;
@@ -242,8 +257,9 @@ async fn transition_allows_every_legal_state_change() {
 
     for (index, (from, to)) in legal.into_iter().enumerate() {
         let job = create_job_in_state(&repository, from).await;
-        let event =
-            JobEvent::new(JobEventKind::StateChanged).with_warning(format!("legal-{index}"));
+        let event = JobEvent::new(JobEventKind::StateChanged)
+            .with_warning(format!("legal-{index}"))
+            .unwrap();
         let updated = repository
             .transition(job.id, job.version, to, Some(event))
             .await
@@ -415,9 +431,46 @@ async fn list_paginates_by_created_at() {
         vec![third.id, second.id, first.id]
     );
 
-    let older = repository.list(10, Some(second.created_at)).await.unwrap();
+    let older = repository
+        .list(10, Some(JobListCursor::from_job(&second)))
+        .await
+        .unwrap();
     assert_eq!(older.len(), 1);
     assert_eq!(older[0].id, first.id);
+}
+
+#[tokio::test]
+async fn list_paginates_through_jobs_with_identical_timestamps() {
+    let (_temp_dir, pool, repository) = test_repository().await;
+    let mut jobs = Vec::new();
+    for seed in 60..65 {
+        jobs.push(repository.create(new_job(seed)).await.unwrap());
+    }
+    let expected_ids = jobs.iter().map(|job| job.id).collect::<HashSet<_>>();
+
+    let timestamp = sqlx::query_scalar::<_, i64>("SELECT created_at FROM jobs LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET created_at = ?1")
+        .bind(timestamp)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut cursor = None;
+    let mut seen_ids = Vec::new();
+    loop {
+        let page = repository.list(2, cursor).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = Some(JobListCursor::from_job(page.last().unwrap()));
+        seen_ids.extend(page.into_iter().map(|job| job.id));
+    }
+
+    assert_eq!(seen_ids.len(), jobs.len());
+    assert_eq!(seen_ids.into_iter().collect::<HashSet<_>>(), expected_ids);
 }
 
 #[tokio::test]

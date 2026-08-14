@@ -29,6 +29,31 @@ impl fmt::Display for JobId {
     }
 }
 
+/// Typed keyset cursor for browser-safe job listing pagination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JobListCursor {
+    created_at: OffsetDateTime,
+    id: JobId,
+}
+
+impl JobListCursor {
+    pub fn new(created_at: OffsetDateTime, id: JobId) -> Self {
+        Self { created_at, id }
+    }
+
+    pub fn from_job(job: &DownloadJob) -> Self {
+        Self::new(job.created_at, job.id)
+    }
+
+    pub fn created_at(self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    pub fn id(self) -> JobId {
+        self.id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum JobState {
@@ -218,12 +243,12 @@ impl JobEvent {
         Ok(self)
     }
 
-    pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
+    pub fn with_warning(mut self, warning: impl Into<String>) -> Result<Self, JobRepositoryError> {
         self.warning = Some(
             sanitize_text(warning.into(), MAX_WARNING_LEN)
-                .expect("builder warning input must already be safe"),
+                .map_err(JobRepositoryError::InvalidData)?,
         );
-        self
+        Ok(self)
     }
 }
 

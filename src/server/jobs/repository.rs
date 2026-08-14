@@ -6,8 +6,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::model::{
-    DownloadJob, JobEvent, JobEventKind, JobId, JobProgress, JobRepositoryError, JobState, NewJob,
-    apply_event_fields, can_transition,
+    DownloadJob, JobEvent, JobEventKind, JobId, JobListCursor, JobProgress, JobRepositoryError,
+    JobState, NewJob, apply_event_fields, can_transition,
 };
 use crate::catalog::{CatalogId, MediaType, SourceId, SubtitleId};
 
@@ -251,21 +251,22 @@ impl JobRepository {
     pub async fn list(
         &self,
         limit: u32,
-        before: Option<OffsetDateTime>,
+        cursor: Option<JobListCursor>,
     ) -> Result<Vec<DownloadJob>, JobRepositoryError> {
         let limit = i64::from(limit.clamp(1, 100));
-        let rows = match before {
-            Some(before) => {
+        let rows = match cursor {
+            Some(cursor) => {
                 sqlx::query(
                     r#"
                     SELECT *
                     FROM jobs
-                    WHERE created_at < ?1
+                    WHERE created_at < ?1 OR (created_at = ?1 AND id < ?2)
                     ORDER BY created_at DESC, id DESC
-                    LIMIT ?2
+                    LIMIT ?3
                     "#,
                 )
-                .bind(to_millis(before)?)
+                .bind(to_millis(cursor.created_at())?)
+                .bind(cursor.id().to_string())
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await?
