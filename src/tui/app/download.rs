@@ -166,10 +166,9 @@ impl App {
 
         let cancel = self.state.cancel_download.clone();
         let sender = self.action_sender.clone();
-        let client = reqwest::Client::builder()
+        let client = crate::download::DownloadClient::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .tcp_keepalive(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("download HTTP client configuration should be valid");
 

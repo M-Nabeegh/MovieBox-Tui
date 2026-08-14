@@ -1,5 +1,5 @@
 use reqwest::{
-    Client, Method, StatusCode,
+    Method, StatusCode,
     header::{
         ACCEPT_RANGES, CONTENT_RANGE, ETAG, HeaderMap, HeaderName, HeaderValue, IF_RANGE,
         LAST_MODIFIED, RANGE,
@@ -19,7 +19,10 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 #[cfg(feature = "server")]
-use crate::server::security::net::{NetSecurityError, follow_checked_redirects};
+pub use crate::server::security::net::DownloadClient;
+
+#[cfg(feature = "server")]
+use crate::server::security::net::{DownloadResponse, NetSecurityError, follow_checked_redirects};
 
 #[cfg(not(feature = "server"))]
 mod security_net {
@@ -27,7 +30,10 @@ mod security_net {
 }
 
 #[cfg(not(feature = "server"))]
-use security_net::{NetSecurityError, follow_checked_redirects};
+pub use security_net::DownloadClient;
+
+#[cfg(not(feature = "server"))]
+use security_net::{DownloadResponse, NetSecurityError, follow_checked_redirects};
 
 const MAX_ATTEMPTS: usize = 4;
 const SEGMENT_THRESHOLD: u64 = 32 * 1024 * 1024;
@@ -131,7 +137,7 @@ struct ResumeMetadata {
 }
 
 pub async fn download<F>(
-    client: &Client,
+    client: &DownloadClient,
     request: DownloadRequest,
     destination: &Path,
     cancel: Arc<AtomicBool>,
@@ -368,7 +374,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn download_segmented<F>(
-    client: &Client,
+    client: &DownloadClient,
     request: &DownloadRequest,
     url: &Url,
     destination: &Path,
@@ -521,7 +527,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
-    client: &Client,
+    client: &DownloadClient,
     request: &DownloadRequest,
     url: &Url,
     path: &Path,
@@ -644,7 +650,7 @@ async fn download_segment(
 }
 
 pub async fn fetch_bytes(
-    client: &Client,
+    client: &DownloadClient,
     request: &DownloadRequest,
 ) -> Result<Vec<u8>, DownloadError> {
     let response = follow_checked_redirects(
@@ -658,7 +664,7 @@ pub async fn fetch_bytes(
     if !response.status().is_success() {
         return Err(DownloadError::Http(response.status()));
     }
-    Ok(response.bytes().await?.to_vec())
+    Ok(response.bytes().await?)
 }
 
 pub fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, DownloadError> {
@@ -806,10 +812,7 @@ fn insert_header(
     Ok(())
 }
 
-fn header_string(
-    response: &reqwest::Response,
-    name: reqwest::header::HeaderName,
-) -> Option<String> {
+fn header_string(response: &DownloadResponse, name: reqwest::header::HeaderName) -> Option<String> {
     response
         .headers()
         .get(name)

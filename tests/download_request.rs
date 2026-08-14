@@ -144,7 +144,7 @@ async fn subtitle_redirect_requests_preserve_source_headers() {
     .unwrap();
 
     let bytes = response.bytes().await.unwrap();
-    assert_eq!(bytes.as_ref(), server.subtitle_bytes());
+    assert_eq!(bytes.as_slice(), server.subtitle_bytes());
     let requests = server.requests();
     assert!(
         requests
@@ -168,6 +168,25 @@ async fn redirects_to_private_targets_are_rejected_before_following() {
         &client,
         Method::GET,
         server.url("/redirect/private"),
+        FixtureServer::required_headers(),
+        2,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("127.0.0.1"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn resolver_and_connected_peer_mismatch_is_rejected() {
+    let server = FixtureServer::start(1024).await.unwrap();
+    let client = server.mismatched_client();
+
+    let error = follow_checked_redirects(
+        &client,
+        Method::GET,
+        server.url("/download"),
         FixtureServer::required_headers(),
         2,
     )

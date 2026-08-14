@@ -1,12 +1,9 @@
-use reqwest::{
-    Client,
-    header::{HeaderMap, HeaderName, HeaderValue},
-    redirect::Policy,
-};
+use moviebox_tui::server::security::net::{AddressResolver, DownloadClient, ResolveFuture};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::{
     collections::HashMap,
     io,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -25,6 +22,16 @@ const REQUIRED_HEADER_NAME: &str = "x-moviebox-auth";
 const REQUIRED_HEADER_VALUE: &str = "fixture-token";
 const FIXTURE_ETAG: &str = "\"fixture-etag\"";
 const FIXTURE_LAST_MODIFIED: &str = "Fri, 01 Jan 2021 00:00:00 GMT";
+const TEST_PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+
+#[derive(Clone, Copy)]
+struct FixtureResolver;
+
+impl AddressResolver for FixtureResolver {
+    fn resolve<'a>(&'a self, _host: &'a str, port: u16) -> ResolveFuture<'a> {
+        Box::pin(async move { Ok(vec![SocketAddr::new(IpAddr::V4(TEST_PUBLIC_IP), port)]) })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
@@ -96,12 +103,24 @@ impl FixtureServer {
         self.state.drop_first_ranged.store(true, Ordering::Relaxed);
     }
 
-    pub fn client(&self) -> Client {
-        Client::builder()
-            .redirect(Policy::none())
+    pub fn client(&self) -> DownloadClient {
+        DownloadClient::builder()
             .resolve(FIXTURE_HOST, self.address)
+            .resolver(FixtureResolver)
+            .test_peer_address(SocketAddr::new(
+                IpAddr::V4(TEST_PUBLIC_IP),
+                self.address.port(),
+            ))
             .build()
             .expect("fixture client")
+    }
+
+    pub fn mismatched_client(&self) -> DownloadClient {
+        DownloadClient::builder()
+            .resolve(FIXTURE_HOST, self.address)
+            .resolver(FixtureResolver)
+            .build()
+            .expect("fixture mismatch client")
     }
 
     pub fn url(&self, path: &str) -> Url {
