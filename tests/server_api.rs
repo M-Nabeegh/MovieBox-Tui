@@ -7,7 +7,16 @@ use axum::{
         header::{CONTENT_TYPE, HOST, ORIGIN, SET_COOKIE},
     },
 };
-use moviebox_tui::server::{config::ServerConfig, db::connect, routes, state::AppState};
+use moviebox_tui::{
+    catalog::{CatalogId, MediaType, SourceId},
+    server::{
+        config::ServerConfig,
+        db::connect,
+        jobs::{JobRepository, JobState, NewJob},
+        routes,
+        state::AppState,
+    },
+};
 use serde_json::Value;
 use serde_json::json;
 use std::{collections::HashMap, fs};
@@ -17,6 +26,7 @@ use tower::ServiceExt;
 struct TestContext {
     _root: TempDir,
     app: axum::Router,
+    jobs: JobRepository,
 }
 
 impl TestContext {
@@ -73,9 +83,11 @@ impl TestContext {
         let config = ServerConfig::from_map(env).unwrap();
         let pool = connect(&config.database_url).await.unwrap();
         let state = AppState::bootstrap(config, pool).await.unwrap();
+        let jobs = state.jobs().clone();
         Self {
             _root: root,
             app: routes::router(state),
+            jobs,
         }
     }
 
@@ -126,6 +138,44 @@ impl TestContext {
             .to_string();
         (cookie, csrf)
     }
+}
+
+#[tokio::test]
+async fn server_bootstrap_starts_worker_for_queued_jobs() {
+    let context = TestContext::new().await;
+    let job = context
+        .jobs
+        .create(NewJob {
+            catalog_id: CatalogId::new("invalid-catalog".to_string()),
+            source_id: SourceId::new("invalid-source".to_string()),
+            subtitle_id: None,
+            title: "Worker smoke test".to_string(),
+            year: Some("2026".to_string()),
+            media_type: MediaType::Movie,
+            season_number: None,
+            episode_number: None,
+            episode_title: None,
+            requested_height: 1080,
+            final_video_path: "Movies/Worker smoke test (2026)/Worker smoke test (2026).mkv"
+                .to_string(),
+            final_subtitle_path: None,
+            partial_video_path: "_moviebox/jobs/not-the-job/Worker smoke test.mkv.part".to_string(),
+            partial_subtitle_path: None,
+        })
+        .await
+        .unwrap();
+
+    for _ in 0..20 {
+        let current = context.jobs.get(job.id).await.unwrap();
+        if current.state != JobState::Queued {
+            assert_eq!(current.state, JobState::Failed);
+            assert_eq!(current.error_code.as_deref(), Some("unsafe_path"));
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    panic!("queued job was not claimed by the server worker");
 }
 
 #[tokio::test]

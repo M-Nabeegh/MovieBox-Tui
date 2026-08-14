@@ -59,3 +59,30 @@ impl CatalogService {
         self.provider.resolve(source, subtitle).await
     }
 }
+
+#[async_trait]
+impl CatalogProvider for CatalogService {
+    async fn search(&self, query: &str, page: u32) -> Result<SearchPage, CatalogError> {
+        CatalogService::search(self, query, page).await
+    }
+
+    async fn details(&self, id: &CatalogId) -> Result<CatalogDetails, CatalogError> {
+        CatalogService::details(self, id).await
+    }
+
+    async fn sources(&self, request: EpisodeRequest) -> Result<Vec<SourceOption>, CatalogError> {
+        CatalogService::sources(self, request).await
+    }
+
+    async fn subtitles(&self, source: &SourceId) -> Result<Vec<SubtitleTrack>, CatalogError> {
+        CatalogService::subtitles(self, source).await
+    }
+
+    async fn resolve(
+        &self,
+        source: &SourceId,
+        subtitle: Option<&SubtitleId>,
+    ) -> Result<ResolvedSource, CatalogError> {
+        CatalogService::resolve(self, source, subtitle).await
+    }
+}

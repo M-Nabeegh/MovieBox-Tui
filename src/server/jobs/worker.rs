@@ -306,6 +306,11 @@ where
         }
     }
 
+    pub fn with_reserve_bytes(mut self, reserve_bytes: u64) -> Self {
+        self.reserve_bytes = reserve_bytes;
+        self
+    }
+
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), WorkerError> {
         loop {
             if cancel.is_cancelled() {

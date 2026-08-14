@@ -1,14 +1,20 @@
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
+use tokio_util::sync::CancellationToken;
 
 use crate::server::{
-    auth::AuthService, config::ServerConfig, error::ServerError, events::JobEventBus,
-    jobs::JobRepository,
+    auth::AuthService,
+    config::ServerConfig,
+    error::ServerError,
+    events::JobEventBus,
+    jobs::{HttpTransferClient, JobRepository, JobWorker, recover_interrupted_jobs},
+    library::LibraryNamer,
 };
 use crate::{
     catalog::moviebox::MovieBoxCatalogProvider,
     catalog::{CatalogProvider, CatalogService, OpaqueIdCodec, QualityPolicy},
+    download::DownloadClient,
     providers::moviebox::client::MovieBoxClient,
 };
 
@@ -37,7 +43,35 @@ impl AppState {
             OpaqueIdCodec::new(config.session_pepper),
             QualityPolicy::new(config.maximum_height),
         );
-        Self::from_provider(config, pool, auth, Arc::new(provider))
+        let state = Self::from_provider(config, pool, auth, Arc::new(provider))?;
+        state.start_worker().await?;
+        Ok(state)
+    }
+
+    async fn start_worker(&self) -> Result<(), ServerError> {
+        let namer = LibraryNamer::new(self.inner.config.media_root.clone())
+            .map_err(|error| ServerError::Startup(format!("library setup failed: {error}")))?;
+        recover_interrupted_jobs(&self.inner.jobs, namer.media_root())
+            .await
+            .map_err(|error| ServerError::Startup(format!("job recovery failed: {error}")))?;
+        let download_client = DownloadClient::new().map_err(|error| {
+            ServerError::Startup(format!("download client initialization failed: {error}"))
+        })?;
+        let worker = JobWorker::new(
+            Arc::new(self.inner.jobs.clone()),
+            Arc::clone(&self.inner.catalog),
+            Arc::new(HttpTransferClient::new(download_client)),
+            namer,
+            self.inner.events.clone(),
+        )
+        .with_reserve_bytes(self.inner.config.reserve_bytes);
+
+        tokio::spawn(async move {
+            if let Err(error) = worker.run(CancellationToken::new()).await {
+                eprintln!("[moviebox-server] job worker stopped: {error}");
+            }
+        });
+        Ok(())
     }
 
     fn from_provider(
