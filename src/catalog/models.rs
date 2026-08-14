@@ -256,6 +256,13 @@ pub enum CatalogError {
     InvalidOpaqueId,
     #[error("catalog opaque identifier failed verification")]
     OpaqueIdVerificationFailed,
+    #[error(
+        "catalog source resolution {actual_height}p does not match signed resolution {signed_height}p"
+    )]
+    SourceResolutionMismatch {
+        signed_height: u16,
+        actual_height: u16,
+    },
     #[error("no source is available at or below {maximum_height}p")]
     QualityUnavailable {
         maximum_height: u16,

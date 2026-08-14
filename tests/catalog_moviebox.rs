@@ -6,7 +6,10 @@ mod fixtures;
 use fixtures::fixture;
 use moviebox_tui::catalog::{
     CatalogError, MediaType, OpaqueIdCodec, OpaquePayload, QualityPolicy,
-    moviebox::{adapt_details, adapt_search_page, adapt_sources, adapt_subtitles},
+    moviebox::{
+        adapt_details, adapt_search_page, adapt_sources, adapt_subtitles,
+        validate_source_item_resolution,
+    },
 };
 
 fn fixture_codec() -> OpaqueIdCodec {
@@ -17,7 +20,7 @@ fn fixture_codec() -> OpaqueIdCodec {
 fn search_results_are_typed_and_hide_provider_urls() {
     let payload = fixture("moviebox-search.json");
 
-    let page = adapt_search_page(&payload, &fixture_codec()).unwrap();
+    let page = adapt_search_page(&payload, &fixture_codec(), 1).unwrap();
 
     assert_eq!(page.items.len(), 2);
     assert_eq!(page.items[0].title, "Fixture Movie");
@@ -28,6 +31,27 @@ fn search_results_are_typed_and_hide_provider_urls() {
     assert!(!serialized.contains("https://"));
     assert!(!serialized.contains("poster"));
     assert!(!serialized.contains("subject-fixture"));
+}
+
+#[test]
+fn search_page_preserves_requested_later_page_without_inventing_more_results() {
+    let payload = fixture("moviebox-search.json");
+
+    let page = adapt_search_page(&payload, &fixture_codec(), 3).unwrap();
+
+    assert_eq!(page.page, 3);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn search_page_uses_explicit_provider_pager_flag_when_available() {
+    let mut payload = fixture("moviebox-search.json");
+    payload["pager"] = serde_json::json!({ "hasMore": true });
+
+    let page = adapt_search_page(&payload, &fixture_codec(), 2).unwrap();
+
+    assert_eq!(page.page, 2);
+    assert!(page.has_more);
 }
 
 #[test]
@@ -100,6 +124,60 @@ fn quality_policy_reports_when_no_source_is_within_limit() {
     let error = adapt_sources(&payload, &fixture_codec(), QualityPolicy::new(1080)).unwrap_err();
 
     assert!(matches!(error, CatalogError::QualityUnavailable { .. }));
+}
+
+#[test]
+fn malformed_source_resource_id_is_invalid_payload() {
+    let payload = serde_json::json!({
+        "subjectId": "subject-fixture-2",
+        "list": [{ "resolution": 1080 }]
+    });
+
+    let error = adapt_sources(&payload, &fixture_codec(), QualityPolicy::new(1080)).unwrap_err();
+
+    assert_eq!(error, CatalogError::InvalidPayload("resourceId"));
+}
+
+#[test]
+fn malformed_source_resolution_is_invalid_payload() {
+    let payload = serde_json::json!({
+        "subjectId": "subject-fixture-2",
+        "list": [{ "resourceId": "resource-fixture-invalid", "resolution": "unknown" }]
+    });
+
+    let error = adapt_sources(&payload, &fixture_codec(), QualityPolicy::new(1080)).unwrap_err();
+
+    assert_eq!(error, CatalogError::InvalidPayload("resolution"));
+}
+
+#[test]
+fn resolved_source_resolution_must_match_signed_source_height() {
+    let item = serde_json::json!({ "resolution": 720 });
+
+    let error = validate_source_item_resolution(&item, 1080, QualityPolicy::new(1080)).unwrap_err();
+
+    assert_eq!(
+        error,
+        CatalogError::SourceResolutionMismatch {
+            signed_height: 1080,
+            actual_height: 720,
+        }
+    );
+}
+
+#[test]
+fn resolved_source_resolution_is_checked_against_quality_policy() {
+    let item = serde_json::json!({ "resolution": 2160 });
+
+    let error = validate_source_item_resolution(&item, 1080, QualityPolicy::new(1080)).unwrap_err();
+
+    assert_eq!(
+        error,
+        CatalogError::QualityUnavailable {
+            maximum_height: 1080,
+            requested_height: Some(2160),
+        }
+    );
 }
 
 #[test]

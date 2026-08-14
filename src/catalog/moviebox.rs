@@ -36,6 +36,15 @@ fn extract_subjects(payload: &Value) -> Result<&Vec<Value>, CatalogError> {
         .ok_or(CatalogError::InvalidPayload("results[0].subjects"))
 }
 
+fn search_has_more(payload: &Value) -> bool {
+    payload
+        .get("pager")
+        .and_then(Value::as_object)
+        .and_then(|pager| pager.get("hasMore").or_else(|| pager.get("has_more")))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn media_type_from_value(subject_type: i64) -> MediaType {
     if subject_type == 2 {
         MediaType::Series
@@ -171,6 +180,22 @@ fn parse_u16_field(value: &Value, key: &'static str) -> Result<u16, CatalogError
         .ok_or(CatalogError::InvalidPayload(key))
 }
 
+pub fn validate_source_item_resolution(
+    item: &Value,
+    signed_height: u16,
+    policy: QualityPolicy,
+) -> Result<u16, CatalogError> {
+    let actual_height = parse_u16_field(item, "resolution")?;
+    policy.validate(actual_height)?;
+    if actual_height != signed_height {
+        return Err(CatalogError::SourceResolutionMismatch {
+            signed_height,
+            actual_height,
+        });
+    }
+    Ok(actual_height)
+}
+
 fn parse_optional_u16_field(value: &Value, key: &'static str) -> Option<u16> {
     value.get(key).and_then(|field| {
         field
@@ -278,9 +303,13 @@ fn decode_subtitle(
     }
 }
 
+/// Adapts one MovieBox search response. Only an explicit boolean `pager.hasMore`
+/// or `pager.has_more` is trusted; without it, `has_more` stays false rather
+/// than being inferred from the number of returned items.
 pub fn adapt_search_page(
     payload: &Value,
     codec: &OpaqueIdCodec,
+    page: u32,
 ) -> Result<SearchPage, CatalogError> {
     let items = extract_subjects(payload)?
         .iter()
@@ -308,9 +337,9 @@ pub fn adapt_search_page(
         .collect::<Vec<_>>();
 
     Ok(SearchPage {
-        page: 1,
+        page,
         items,
-        has_more: false,
+        has_more: search_has_more(payload),
     })
 }
 
@@ -362,40 +391,42 @@ pub fn adapt_sources(
     policy: QualityPolicy,
 ) -> Result<Vec<SourceOption>, CatalogError> {
     let subject_id = source_subject_id(payload)?;
-    let mut options = source_items(payload)?
-        .iter()
-        .filter_map(|item| {
-            let resource_id = item.get("resourceId").and_then(Value::as_str)?;
-            let height = parse_u16_field(item, "resolution").ok()?;
-            if policy.validate(height).is_err() {
-                return None;
-            }
+    let mut options = Vec::new();
+    for item in source_items(payload)? {
+        let resource_id = item
+            .get("resourceId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(CatalogError::InvalidPayload("resourceId"))?;
+        let height = parse_u16_field(item, "resolution")?;
+        if policy.validate(height).is_err() {
+            continue;
+        }
 
-            let codec_name = optional_string(item, "codecName");
-            let mut label = format!("{height}p");
-            if let Some(codec_name) = codec_name.as_deref() {
-                label = format!("{label} {}", codec_name.to_ascii_uppercase());
-            }
+        let codec_name = optional_string(item, "codecName");
+        let mut label = format!("{height}p");
+        if let Some(codec_name) = codec_name.as_deref() {
+            label = format!("{label} {}", codec_name.to_ascii_uppercase());
+        }
 
-            Some(SourceOption {
-                id: SourceId::new(codec.encode(&OpaquePayload::Source {
-                    provider: MOVIEBOX_PROVIDER.to_string(),
-                    subject_id: subject_id.to_string(),
-                    resource_id: resource_id.to_string(),
-                    season: parse_optional_u16_field(item, "se"),
-                    episode: parse_optional_u16_field(item, "ep"),
-                    height,
-                    language: optional_string(item, "lanName"),
-                })),
+        options.push(SourceOption {
+            id: SourceId::new(codec.encode(&OpaquePayload::Source {
+                provider: MOVIEBOX_PROVIDER.to_string(),
+                subject_id: subject_id.to_string(),
+                resource_id: resource_id.to_string(),
+                season: parse_optional_u16_field(item, "se"),
+                episode: parse_optional_u16_field(item, "ep"),
                 height,
-                label,
-                size_bytes: parse_optional_u64_field(item, "sizeBytes")
-                    .or_else(|| parse_optional_u64_field(item, "size")),
                 language: optional_string(item, "lanName"),
-                recommended: false,
-            })
-        })
-        .collect::<Vec<_>>();
+            })),
+            height,
+            label,
+            size_bytes: parse_optional_u64_field(item, "sizeBytes")
+                .or_else(|| parse_optional_u64_field(item, "size")),
+            language: optional_string(item, "lanName"),
+            recommended: false,
+        });
+    }
 
     options.sort_by_key(|option| std::cmp::Reverse(option.height));
     if let Some(first) = options.first_mut() {
@@ -540,7 +571,7 @@ impl From<ScraperError> for CatalogError {
 impl CatalogProvider for MovieBoxCatalogProvider {
     async fn search(&self, query: &str, page: u32) -> Result<SearchPage, CatalogError> {
         let payload = self.client.search(query, page as usize).await?;
-        adapt_search_page(&payload, &self.codec)
+        adapt_search_page(&payload, &self.codec, page)
     }
 
     async fn details(&self, id: &CatalogId) -> Result<CatalogDetails, CatalogError> {
@@ -603,6 +634,7 @@ impl CatalogProvider for MovieBoxCatalogProvider {
         let payload = ensure_object_with_subject_id(payload, &subject_id);
         let item =
             find_source_item(&payload, &resource_id).ok_or(CatalogError::NotFound("source"))?;
+        validate_source_item_resolution(item, height, self.quality_policy)?;
         let url = Url::parse(string_field(item, "resourceLink")?)
             .map_err(|_| CatalogError::InvalidPayload("resourceLink"))?;
         let expected_size = parse_optional_u64_field(item, "sizeBytes")
