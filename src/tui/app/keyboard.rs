@@ -54,6 +54,39 @@ impl App {
             return None;
         }
 
+        if self.state.show_browse_popup {
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.show_browse_popup = false;
+                    self.state.browse_list_state.select(None);
+                }
+                KeyCode::Up => {
+                    let max = crate::tui::state::BrowsePreset::ALL.len().saturating_sub(1);
+                    let next = match self.state.browse_list_state.selected() {
+                        Some(0) | None => max,
+                        Some(index) => index.saturating_sub(1),
+                    };
+                    self.state.browse_list_state.select(Some(next));
+                }
+                KeyCode::Down => {
+                    let max = crate::tui::state::BrowsePreset::ALL.len().saturating_sub(1);
+                    let next = match self.state.browse_list_state.selected() {
+                        Some(index) if index < max => index + 1,
+                        _ => 0,
+                    };
+                    self.state.browse_list_state.select(Some(next));
+                }
+                KeyCode::Enter => {
+                    let index = self.state.browse_list_state.selected().unwrap_or(0);
+                    if let Some(preset) = crate::tui::state::BrowsePreset::ALL.get(index).copied() {
+                        self.action_sender.send(Action::SelectBrowse(preset)).ok();
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         if self.state.show_theme_popup {
             match key.code {
                 KeyCode::Esc => {

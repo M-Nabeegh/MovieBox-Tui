@@ -35,6 +35,8 @@ impl App {
         self.state.active_provider = provider;
         self.state.active_screen = Screen::Home;
         self.state.is_homepage_mode = false;
+        self.state.active_browse_preset = None;
+        self.state.browse_metrics.clear();
         self.state.is_tv_mode = false;
         self.state.is_loading = false;
         self.state.is_fetching_streams = false;
@@ -337,6 +339,11 @@ impl App {
                     self.state.show_help = false;
                     return None;
                 }
+                if self.state.show_browse_popup {
+                    self.state.show_browse_popup = false;
+                    self.state.browse_list_state.select(None);
+                    return None;
+                }
                 match self.state.active_screen {
                     Screen::Startup => {}
                     Screen::Home => {
@@ -347,6 +354,8 @@ impl App {
                                 self.state.active_preview_request.wrapping_add(1);
                             self.state.search_poster_protocols.clear();
                             self.state.search_results.clear();
+                            self.state.active_browse_preset = None;
+                            self.state.browse_metrics.clear();
                             self.state.search_error = None;
                             self.state.search_query.clear();
                             self.state.search_suggestions.clear();

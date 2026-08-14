@@ -31,6 +31,7 @@ The app is message-driven and organized into focused modules. Full maps live in
 [`docs/architecture.md`](docs/architecture.md) and [`docs/modules.md`](docs/modules.md).
 
 Short version:
+
 - `src/tui/app/`: The application object (`App`). `run.rs` holds the thin
   `handle_action` dispatcher that routes every `Action` to a `handle_*` method in its
   module (`run.rs`, `requests.rs`, `playback.rs`, `download.rs`, `navigation.rs`,
@@ -72,6 +73,7 @@ For release readiness, static checks are not enough on their own. Before declari
 release production-ready, work through [`docs/release-checklist.md`](docs/release-checklist.md).
 
 **Guidelines:**
+
 - Follow idiomatic Rust and standard `rustfmt` defaults. Don't hand-format.
 - Keep the async, message-passing architecture intact.
 - Avoid panics on paths that handle network or user input.
@@ -82,6 +84,7 @@ release production-ready, work through [`docs/release-checklist.md`](docs/releas
 Follow [Conventional Commits](https://www.conventionalcommits.org/). Keep the subject concise and in the imperative mood.
 
 Examples:
+
 - `feat: add support for custom mpv arguments`
 - `fix: prevent panic when clipboard is unavailable`
 - `docs: document /anime discover command`

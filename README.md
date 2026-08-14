@@ -117,8 +117,9 @@ pkg install rust openssl pkg-config
 cargo install moviebox-tui --locked
 termux-setup-storage
 ```
-*`termux-setup-storage` is recommended if you want downloads saved to the real
-Android `Download` folder.*
+
+_`termux-setup-storage` is recommended if you want downloads saved to the real
+Android `Download` folder._
 
 <details>
 <summary><b>Build from source</b></summary>
@@ -201,6 +202,7 @@ moviebox-tui
 | Command              | Action                                    |
 | -------------------- | ----------------------------------------- |
 | `/discover`, `/home` | Open discovery view                       |
+| `/browse`            | Browse curated, rated, and most-watched views |
 | `/history`           | Show watch history                        |
 | `/movies`            | Browse movies                             |
 | `/shows`, `/tvshows` | Browse series                             |

@@ -3,8 +3,96 @@ use crate::providers::models::{ProviderKind, RequestContext};
 use crate::tui::{
     action::Action,
     overlay::NotificationKind,
-    state::{InputMode, Screen, SearchResult},
+    state::{BrowseMetrics, BrowsePreset, InputMode, Screen, SearchResult},
 };
+
+fn metric_value(item: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    let mut containers = vec![item];
+    if let Some(metadata) = item.get("metadata") {
+        containers.push(metadata);
+    }
+    if let Some(meta) = item.get("meta") {
+        containers.push(meta);
+    }
+
+    containers.into_iter().find_map(|container| {
+        keys.iter().find_map(|key| {
+            let value = container.get(*key)?;
+            value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|number| number as f64))
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+    })
+}
+
+fn extract_browse_metrics(item: &serde_json::Value) -> BrowseMetrics {
+    BrowseMetrics {
+        trending: metric_value(
+            item,
+            &["__browse_rank", "imdb_trending", "imdbTrending", "trending"],
+        ),
+        rating: metric_value(
+            item,
+            &["imdbRatingValue", "imdbRate", "imdb_rating", "imdbRating"],
+        ),
+        recent_rating: metric_value(
+            item,
+            &[
+                "imdb_rating_30d",
+                "imdbRating30Days",
+                "imdbRatingLast30Days",
+                "imdb_rating_recent",
+                "imdbRatingValue",
+                "imdbRate",
+            ],
+        ),
+        popularity: metric_value(
+            item,
+            &[
+                "__browse_rank",
+                "imdb_popularity",
+                "imdbPopularity",
+                "popularity",
+                "viewers",
+            ],
+        ),
+    }
+}
+
+fn browse_group_matches(title: &str, preset: BrowsePreset) -> bool {
+    let title = title.to_lowercase();
+    match preset.metric() {
+        crate::tui::state::BrowseMetric::Trending => {
+            title.contains("trending") || title.contains("hot")
+        }
+        crate::tui::state::BrowseMetric::Rating => title.contains("top") || title.contains("rated"),
+        crate::tui::state::BrowseMetric::RecentRating => {
+            title.contains("new") || title.contains("release") || title.contains("recent")
+        }
+        crate::tui::state::BrowseMetric::Popularity => {
+            title.contains("popular") || title.contains("most") || title.contains("watched")
+        }
+    }
+}
+
+fn compare_browse_values(
+    left: Option<f64>,
+    right: Option<f64>,
+    descending: bool,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let order = left
+                .partial_cmp(&right)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if descending { order.reverse() } else { order }
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
 
 impl App {
     pub(super) fn apply_tv_search_results(&mut self, query: &str, lower_query: &str) {
@@ -81,6 +169,12 @@ impl App {
             self.state.search_query.clear();
             self.state.input_mode = InputMode::Normal;
             self.action_sender.send(Action::ToggleThemePopup).ok();
+            return Some(true);
+        }
+        if lower_query == "/browse" {
+            self.state.search_query.clear();
+            self.state.input_mode = InputMode::Normal;
+            self.action_sender.send(Action::ShowBrowseMenu).ok();
             return Some(true);
         }
         if lower_query == "/toggle-update" {
@@ -175,6 +269,7 @@ impl App {
                 );
                 return Some(true);
             }
+            self.state.active_browse_preset = None;
             self.action_sender
                 .send(Action::FetchHomepage {
                     tab_id: tid.to_string(),
@@ -191,6 +286,8 @@ impl App {
         self.state.active_search_request = self.state.active_search_request.wrapping_add(1);
         self.state.active_preview_request = self.state.active_preview_request.wrapping_add(1);
         self.state.is_homepage_mode = false;
+        self.state.active_browse_preset = None;
+        self.state.browse_metrics.clear();
         self.state.current_page = 1;
         self.state.active_screen = Screen::Home;
         self.state.active_subject_id = None;
@@ -296,6 +393,7 @@ impl App {
         self.state.search_error = None;
         if page == 1 {
             self.state.search_results.clear();
+            self.state.browse_metrics.clear();
             self.state.search_list_state.select(Some(0));
         }
         self.state.search_suggestions.clear();
@@ -474,6 +572,48 @@ impl App {
         extracted_subjects
     }
 
+    pub(super) fn extract_browse_subjects(
+        payload: &serde_json::Value,
+        preset: BrowsePreset,
+    ) -> Vec<serde_json::Value> {
+        let Some(items) = payload.get("items").and_then(|items| items.as_array()) else {
+            return Vec::new();
+        };
+
+        let matching_items: Vec<_> = items
+            .iter()
+            .filter(|item| {
+                item.get("title")
+                    .and_then(|title| title.as_str())
+                    .is_some_and(|title| browse_group_matches(title, preset))
+            })
+            .collect();
+        let groups = if matching_items.is_empty() {
+            items.iter().collect()
+        } else {
+            matching_items
+        };
+
+        let mut subjects = Vec::new();
+        for group in groups {
+            let Some(group_subjects) = group.get("subjects").and_then(|s| s.as_array()) else {
+                continue;
+            };
+            let rank_metric = preset.metric() == crate::tui::state::BrowseMetric::Trending;
+            for (index, subject) in group_subjects.iter().enumerate() {
+                let mut subject = subject.clone();
+                if rank_metric && let Some(subject_object) = subject.as_object_mut() {
+                    subject_object.insert(
+                        "__browse_rank".to_string(),
+                        serde_json::json!((group_subjects.len() - index) as f64),
+                    );
+                }
+                subjects.push(subject);
+            }
+        }
+        subjects
+    }
+
     pub(super) fn append_homepage_subjects(&mut self, subjects: Vec<serde_json::Value>) -> usize {
         let mut count = 0;
         for item in subjects {
@@ -506,8 +646,15 @@ impl App {
                 .and_then(|u| u.as_str())
                 .map(|s| s.to_string());
             let season = item.get("season").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+            let metrics = extract_browse_metrics(&item);
 
             if let Some(existing) = self.state.search_results.iter_mut().find(|r| r.id == id) {
+                let stored_metrics = self.state.browse_metrics.entry(id.clone()).or_default();
+                stored_metrics.trending = stored_metrics.trending.or(metrics.trending);
+                stored_metrics.rating = stored_metrics.rating.or(metrics.rating);
+                stored_metrics.recent_rating =
+                    stored_metrics.recent_rating.or(metrics.recent_rating);
+                stored_metrics.popularity = stored_metrics.popularity.or(metrics.popularity);
                 if season > existing.season {
                     existing.season = season;
                     existing.title = clean_title;
@@ -541,6 +688,7 @@ impl App {
             }
 
             if !id.is_empty() {
+                self.state.browse_metrics.insert(id.clone(), metrics);
                 self.state.search_results.push(SearchResult {
                     id,
                     title: clean_title,
@@ -555,6 +703,30 @@ impl App {
             }
         }
         count
+    }
+
+    pub(super) fn sort_browse_results(&mut self) {
+        let Some(preset) = self.state.active_browse_preset else {
+            return;
+        };
+        let metrics = self.state.browse_metrics.clone();
+        let metric = preset.metric();
+        let descending = preset.descending();
+        self.state.search_results.sort_by(|left, right| {
+            let left_value = metrics
+                .get(&left.id)
+                .and_then(|values| values.value(metric));
+            let right_value = metrics
+                .get(&right.id)
+                .and_then(|values| values.value(metric));
+            let metric_order = compare_browse_values(left_value, right_value, descending);
+            if left_value.is_none() && right_value.is_none() {
+                metric_order
+            } else {
+                metric_order
+                    .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+            }
+        });
     }
 
     pub(super) fn spawn_search_posters(&self, results: Vec<(String, Option<String>)>) {
@@ -582,5 +754,90 @@ impl App {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_browse_metrics_from_string_and_nested_values() {
+        let item = serde_json::json!({
+            "metadata": {
+                "imdb_trending": "9.2",
+                "imdbRatingValue": "7.2",
+                "imdbRatingLast30Days": 8.7
+            },
+            "imdb_popularity": 74
+        });
+
+        let metrics = extract_browse_metrics(&item);
+        assert_eq!(metrics.trending, Some(9.2));
+        assert_eq!(metrics.recent_rating, Some(8.7));
+        assert_eq!(metrics.popularity, Some(74.0));
+        assert_eq!(metrics.rating, Some(7.2));
+    }
+
+    #[test]
+    fn browse_sort_keeps_unranked_titles_at_the_end() {
+        assert_eq!(
+            compare_browse_values(Some(7.0), Some(8.0), true),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_browse_values(Some(7.0), Some(8.0), false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_browse_values(Some(7.0), None, true),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn browse_extraction_uses_matching_curated_group() {
+        let payload = serde_json::json!({
+            "items": [
+                {
+                    "title": "Trending in Cinema",
+                    "subjects": [
+                        {"subjectId": "trending-1", "title": "Current hit"}
+                    ]
+                },
+                {
+                    "title": "Top 20 Movies",
+                    "subjects": [
+                        {"subjectId": "top-1", "title": "All-time favorite"}
+                    ]
+                }
+            ]
+        });
+
+        let subjects = App::extract_browse_subjects(&payload, BrowsePreset::TrendingDesc);
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0]["subjectId"], "trending-1");
+        assert_eq!(subjects[0]["__browse_rank"], 1.0);
+    }
+
+    #[test]
+    fn popularity_does_not_alias_top_rated_group() {
+        let payload = serde_json::json!({
+            "items": [
+                {
+                    "title": "Top 20 Movies",
+                    "subjects": [{"subjectId": "top-1", "title": "All-time favorite"}]
+                },
+                {
+                    "title": "Most Watched",
+                    "subjects": [{"subjectId": "watched-1", "title": "Most watched"}]
+                }
+            ]
+        });
+
+        let subjects = App::extract_browse_subjects(&payload, BrowsePreset::PopularDesc);
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0]["subjectId"], "watched-1");
+        assert!(subjects[0].get("__browse_rank").is_none());
     }
 }

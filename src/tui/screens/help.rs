@@ -124,6 +124,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Span::styled("Trending & Featured", theme.text),
             ]),
             Line::from(vec![
+                Span::styled("    /browse    ", theme.header),
+                Span::styled("IMDb-ranked movie views", theme.text),
+            ]),
+            Line::from(vec![
                 Span::styled("    /history   ", theme.header),
                 Span::styled("Watch History", theme.text),
             ]),

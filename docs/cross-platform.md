@@ -5,11 +5,11 @@ Supported: macOS, Linux, Windows, and Android (Termux). The codebase uses
 
 ## OS notes
 
-| Platform | Notes |
-|---|---|
-| macOS | IINA preferred player (via bundled `iina-cli`); VLC/mpv `.app` paths detected. `process_group(0)` on spawn. |
-| Windows | mpv/VLC detected via Program Files + `%LOCALAPPDATA%`; players spawned with `CREATE_NO_WINDOW`; path-safe file stems. |
-| Linux | Flatpak mpv/VLC supported (`flatpak run …`); xdg data/cache dirs. |
+| Platform         | Notes                                                                                                                                                                                                                                                                                                |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS            | IINA preferred player (via bundled `iina-cli`); VLC/mpv `.app` paths detected. `process_group(0)` on spawn.                                                                                                                                                                                          |
+| Windows          | mpv/VLC detected via Program Files + `%LOCALAPPDATA%`; players spawned with `CREATE_NO_WINDOW`; path-safe file stems.                                                                                                                                                                                |
+| Linux            | Flatpak mpv/VLC supported (`flatpak run …`); xdg data/cache dirs.                                                                                                                                                                                                                                    |
 | Android (Termux) | Dynamic filesystem checks for `/system/bin/am` or `termux-open`; playback strips `LD_LIBRARY_PATH` and `LD_PRELOAD` before launching the chooser. Real-device chooser behavior should be confirmed separately from the desktop release pipeline; Proot/Termux X11 behavior is environment-dependent. |
 
 ## Terminal capabilities

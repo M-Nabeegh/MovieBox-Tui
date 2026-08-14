@@ -30,6 +30,7 @@ impl App {
                         commands.extend(vec![
                             "/discover",
                             "/home",
+                            "/browse",
                             "/history",
                             "/movies",
                             "/shows",
@@ -153,6 +154,8 @@ impl App {
                     self.state.input_mode = InputMode::Normal;
                     self.state.is_loading = false;
                     self.state.is_homepage_mode = false;
+                    self.state.active_browse_preset = None;
+                    self.state.browse_metrics.clear();
                     self.state.active_screen = Screen::Home;
                     self.state.active_subject_id = None;
                     self.state.active_preview_request =
@@ -235,6 +238,26 @@ impl App {
                 }
                 self.prepare_homepage_request(&tab_id, page);
                 self.run_homepage_request(tab_id, page);
+            }
+
+            Action::SelectBrowse(preset) => {
+                if self.state.active_provider != ProviderKind::MovieBox {
+                    self.state.set_status(
+                        "Browse is available only with the MovieBox provider.".to_string(),
+                        180,
+                    );
+                    return None;
+                }
+                self.state.show_browse_popup = false;
+                self.state.active_browse_preset = Some(preset);
+                self.state.browse_list_state.select(None);
+                self.state.search_query.clear();
+                self.action_sender
+                    .send(Action::FetchHomepage {
+                        tab_id: "2".to_string(),
+                        page: 1,
+                    })
+                    .ok();
             }
 
             Action::SearchSuccess {
@@ -470,8 +493,13 @@ impl App {
                     self.state.search_error = None;
                 }
 
-                let extracted_subjects = Self::extract_homepage_subjects(&payload);
+                let extracted_subjects = self
+                    .state
+                    .active_browse_preset
+                    .map(|preset| Self::extract_browse_subjects(&payload, preset))
+                    .unwrap_or_else(|| Self::extract_homepage_subjects(&payload));
                 let count = self.append_homepage_subjects(extracted_subjects);
+                self.sort_browse_results();
 
                 if count > 0 {
                     self.spawn_search_posters(
@@ -498,10 +526,20 @@ impl App {
 
                 self.prepare_image_refresh();
 
-                self.state.set_status(
-                    format!("Found {} discover items", self.state.search_results.len()),
-                    150,
-                );
+                let status = self
+                    .state
+                    .active_browse_preset
+                    .map(|preset| {
+                        format!(
+                            "{} · {} items",
+                            preset.label(),
+                            self.state.search_results.len()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        format!("Found {} discover items", self.state.search_results.len())
+                    });
+                self.state.set_status(status, 150);
             }
 
             Action::HomepageFailure(request_id, err) => {

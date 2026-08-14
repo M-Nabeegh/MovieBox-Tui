@@ -1125,6 +1125,26 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         );
     }
 
+    if state.show_browse_popup {
+        let items: Vec<String> = crate::tui::state::BrowsePreset::ALL
+            .iter()
+            .map(|preset| preset.label().to_string())
+            .collect();
+        crate::tui::overlay::picker(
+            frame,
+            area,
+            &items,
+            &mut state.browse_list_state,
+            crate::tui::overlay::PickerSpec {
+                title: "Browse Movies",
+                confirm_label: "Open",
+                minimum_width: 42,
+            },
+            theme,
+            state.basic_terminal,
+        );
+    }
+
     if state.player_picker_popup {
         let items = state
             .available_players

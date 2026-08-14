@@ -19,11 +19,11 @@ detected player and saves the chosen player as the next default unless
 
 ## Command construction
 
-| Player | Invocation | Notes |
-|---|---|---|
-| mpv | `mpv --autofit=WxH --geometry=50%:50% --idle=no --keep-open=no [--http-header-fields=..] [--sub-file=..] <url>` | Window sized to the terminal. Flatpak mpv is launched via `flatpak run`. |
-| VLC | `vlc --width=W --height=H --play-and-exit [--http-referrer=..] [--http-user-agent=..] [--sub-file=..] <url>` | |
-| IINA | `iina-cli --keep-running --no-stdin --mpv-autofit=.. --mpv-http-header-fields=.. --mpv-sub-files=.. <url>` | Uses the bundled `iina-cli`; falls back to `open -a IINA <url>` only if the CLI is absent. |
+| Player          | Invocation                                                                                                                                | Notes                                                                                                  |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| mpv             | `mpv --autofit=WxH --geometry=50%:50% --idle=no --keep-open=no [--http-header-fields=..] [--sub-file=..] <url>`                           | Window sized to the terminal. Flatpak mpv is launched via `flatpak run`.                               |
+| VLC             | `vlc --width=W --height=H --play-and-exit [--http-referrer=..] [--http-user-agent=..] [--sub-file=..] <url>`                              |                                                                                                        |
+| IINA            | `iina-cli --keep-running --no-stdin --mpv-autofit=.. --mpv-http-header-fields=.. --mpv-sub-files=.. <url>`                                | Uses the bundled `iina-cli`; falls back to `open -a IINA <url>` only if the CLI is absent.             |
 | Android / Proot | `termux-open --chooser --content-type video/* <url>` (or absolute `/system/bin/am start` fallback, ensuring `.so` injections are dropped) | Opens an app chooser on the device. Real-device chooser behavior should be confirmed for each release. |
 
 Window size is derived from the live terminal size times the real font cell size

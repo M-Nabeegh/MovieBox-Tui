@@ -62,6 +62,8 @@ pub enum Action {
     ShowDownloadSubtitlePopup(serde_json::Value),
     ToggleThemePopup,
     SelectTheme(String),
+    ShowBrowseMenu,
+    SelectBrowse(crate::tui::state::BrowsePreset),
     LaunchMpv(String, Option<String>),
     DownloadStream(Option<String>),
     StartDownload(Option<String>, Option<String>),

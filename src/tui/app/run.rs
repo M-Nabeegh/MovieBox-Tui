@@ -119,6 +119,7 @@ impl App {
             | Action::CacheCleared(..)
             | Action::ToggleThemePopup
             | Action::SelectTheme(..)
+            | Action::ShowBrowseMenu
             | Action::SetStatus(..)
             | Action::CheckForUpdates
             | Action::UpdateAvailable(..) => {
@@ -152,6 +153,7 @@ impl App {
             | Action::SelectSuggestion { .. }
             | Action::Search { .. }
             | Action::FetchHomepage { .. }
+            | Action::SelectBrowse(..)
             | Action::SearchSuccess { .. }
             | Action::SearchFailure(..)
             | Action::HomepageSuccess { .. }
@@ -330,7 +332,7 @@ impl App {
             use ratatui::text::{Line, Span};
             use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-            let popup_width = 65;
+            let popup_width = 70;
             let popup_height = 20;
 
             let h_chunks = Layout::default()
@@ -358,27 +360,65 @@ impl App {
                 Line::from(Span::styled("Update Available!", self.theme.accent))
                     .alignment(Alignment::Center),
                 Line::from(""),
-                Line::from("A new version of MovieBox-Tui is available."),
+                Line::from("A new version of MovieBox-Tui is available.")
+                    .alignment(Alignment::Center),
                 Line::from(""),
-                Line::from(format!("Current: v{}", env!("CARGO_PKG_VERSION"))),
-                Line::from(format!("Latest:  v{}", version)),
+                Line::from(vec![
+                    Span::raw(format!("Current: v{}  ", env!("CARGO_PKG_VERSION"))),
+                    Span::styled("→", self.theme.accent),
+                    Span::raw(format!("  Latest: v{}", version)),
+                ])
+                .alignment(Alignment::Center),
                 Line::from(""),
-                Line::from(Span::styled("Release Notes:", self.theme.highlight)),
+                Line::from(Span::styled(
+                    "─ Release Notes ──────────────────────────────────────────────────",
+                    self.theme.border,
+                ))
+                .alignment(Alignment::Center),
+                Line::from(""),
             ];
 
-            let note_lines = notes
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(3)
-                .collect::<Vec<_>>();
-            for line in note_lines {
-                text.push(Line::from(crate::tui::text::truncate_width(line, 55)));
+            let note_lines: Vec<&str> = notes.lines().filter(|l| !l.trim().is_empty()).collect();
+
+            let take_count = 6;
+            for line in note_lines.iter().take(take_count) {
+                let trimmed = line.trim();
+                let mut spans = vec![Span::raw("  ")];
+
+                if trimmed.starts_with("### ")
+                    || trimmed.starts_with("## ")
+                    || trimmed.starts_with("# ")
+                {
+                    let text_start = trimmed.find(' ').unwrap_or(0);
+                    spans.push(Span::styled("▌", self.theme.accent));
+                    spans.push(Span::styled(
+                        crate::tui::text::truncate_width(&trimmed[text_start..], 60),
+                        self.theme.highlight,
+                    ));
+                } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                    let text_start = trimmed.find(' ').unwrap_or(0) + 1;
+                    spans.push(Span::styled("• ", self.theme.accent));
+                    spans.push(Span::raw(crate::tui::text::truncate_width(
+                        &trimmed[text_start..],
+                        60,
+                    )));
+                } else {
+                    spans.push(Span::raw(crate::tui::text::truncate_width(trimmed, 64)));
+                }
+                text.push(Line::from(spans));
             }
-            if notes.lines().count() > 3 {
-                text.push(Line::from(Span::styled(
-                    "... (read more on GitHub)",
-                    self.theme.text_dim,
-                )));
+
+            if note_lines.len() > take_count {
+                text.push(Line::from(""));
+                text.push(
+                    Line::from(Span::styled(
+                        "... (read more on GitHub)",
+                        self.theme.text_dim,
+                    ))
+                    .alignment(Alignment::Center),
+                );
+            } else {
+                text.push(Line::from(""));
             }
 
             text.push(Line::from(""));

@@ -5,6 +5,7 @@ impl App {
     pub(super) fn reset_transient_overlays(&mut self) {
         self.state.show_help = false;
         self.state.show_theme_popup = false;
+        self.state.show_browse_popup = false;
         self.state.player_picker_popup = false;
         self.state.player_picker_link = None;
         self.state.player_picker_subtitle = None;
@@ -35,6 +36,8 @@ impl App {
                 self.state.active_preview_request =
                     self.state.active_preview_request.wrapping_add(1);
                 self.state.is_tv_mode = !self.state.is_tv_mode;
+                self.state.active_browse_preset = None;
+                self.state.browse_metrics.clear();
                 self.state.tick_count = 0;
                 self.reset_transient_overlays();
                 self.state.input_mode = crate::tui::state::InputMode::Normal;

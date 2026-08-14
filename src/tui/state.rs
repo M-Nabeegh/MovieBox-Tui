@@ -73,6 +73,90 @@ pub struct SearchResult {
     pub provider: crate::providers::models::ProviderKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseMetric {
+    Trending,
+    Rating,
+    RecentRating,
+    Popularity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowsePreset {
+    TrendingDesc,
+    TrendingAsc,
+    TopRatedAllTimeDesc,
+    TopRatedAllTimeAsc,
+    TopRatedRecentDesc,
+    TopRatedRecentAsc,
+    PopularDesc,
+    PopularAsc,
+}
+
+impl BrowsePreset {
+    pub const ALL: [Self; 8] = [
+        Self::TrendingDesc,
+        Self::TrendingAsc,
+        Self::TopRatedAllTimeDesc,
+        Self::TopRatedAllTimeAsc,
+        Self::TopRatedRecentDesc,
+        Self::TopRatedRecentAsc,
+        Self::PopularDesc,
+        Self::PopularAsc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TrendingDesc => "Trending · High to low",
+            Self::TrendingAsc => "Trending · Low to high",
+            Self::TopRatedAllTimeDesc => "Top Rated · All-time · High to low",
+            Self::TopRatedAllTimeAsc => "Top Rated · All-time · Low to high",
+            Self::TopRatedRecentDesc => "Top Rated · Recent releases · High to low",
+            Self::TopRatedRecentAsc => "Top Rated · Recent releases · Low to high",
+            Self::PopularDesc => "Most Watched · High to low",
+            Self::PopularAsc => "Most Watched · Low to high",
+        }
+    }
+
+    pub fn metric(self) -> BrowseMetric {
+        match self {
+            Self::TrendingDesc | Self::TrendingAsc => BrowseMetric::Trending,
+            Self::TopRatedAllTimeDesc | Self::TopRatedAllTimeAsc => BrowseMetric::Rating,
+            Self::TopRatedRecentDesc | Self::TopRatedRecentAsc => BrowseMetric::RecentRating,
+            Self::PopularDesc | Self::PopularAsc => BrowseMetric::Popularity,
+        }
+    }
+
+    pub fn descending(self) -> bool {
+        matches!(
+            self,
+            Self::TrendingDesc
+                | Self::TopRatedAllTimeDesc
+                | Self::TopRatedRecentDesc
+                | Self::PopularDesc
+        )
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BrowseMetrics {
+    pub trending: Option<f64>,
+    pub rating: Option<f64>,
+    pub recent_rating: Option<f64>,
+    pub popularity: Option<f64>,
+}
+
+impl BrowseMetrics {
+    pub fn value(self, metric: BrowseMetric) -> Option<f64> {
+        match metric {
+            BrowseMetric::Trending => self.trending,
+            BrowseMetric::Rating => self.rating,
+            BrowseMetric::RecentRating => self.recent_rating,
+            BrowseMetric::Popularity => self.popularity,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SubjectStreamPool {
     pub episode_index: std::collections::HashMap<(usize, usize), Vec<serde_json::Value>>,
@@ -135,6 +219,10 @@ pub struct AppState {
     pub show_theme_popup: bool,
     pub active_theme_kind: String,
     pub theme_list_state: ListState,
+    pub show_browse_popup: bool,
+    pub browse_list_state: ListState,
+    pub active_browse_preset: Option<BrowsePreset>,
+    pub browse_metrics: std::collections::HashMap<String, BrowseMetrics>,
 
     pub poster_protocol: Option<(ratatui::layout::Rect, ratatui_image::protocol::Protocol)>,
     pub image_picker: Option<ratatui_image::picker::Picker>,
@@ -253,6 +341,10 @@ impl Default for AppState {
             active_theme_kind: String::new(),
             show_theme_popup: false,
             theme_list_state: ListState::default(),
+            show_browse_popup: false,
+            browse_list_state: ListState::default(),
+            active_browse_preset: None,
+            browse_metrics: std::collections::HashMap::new(),
             poster_protocol: None,
             image_picker: None,
             image_supported: crate::tui::terminal::should_query_images(),

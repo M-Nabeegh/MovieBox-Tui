@@ -6,12 +6,12 @@ shared typed models in `providers/models.rs` and the moviebox JSON schema used b
 
 ## Provider kinds
 
-| Kind | Module | Notes |
-|---|---|---|
-| `MovieBox` | `providers/moviebox` | Primary. Requires request signing (crypto). |
-| `FourKHdHub` | `providers/fourkhdhub` | 4K releases; hubcloud mirror resolver. |
-| `BdixCircleFtp` | `providers/bdix/circleftp` | BDIX FTP directory scrapes. |
-| `BdixDhakaFlix` | `providers/bdix/dhakaflix` | BDIX indexer. |
+| Kind            | Module                     | Notes                                       |
+| --------------- | -------------------------- | ------------------------------------------- |
+| `MovieBox`      | `providers/moviebox`       | Primary. Requires request signing (crypto). |
+| `FourKHdHub`    | `providers/fourkhdhub`     | 4K releases; hubcloud mirror resolver.      |
+| `BdixCircleFtp` | `providers/bdix/circleftp` | BDIX FTP directory scrapes.                 |
+| `BdixDhakaFlix` | `providers/bdix/dhakaflix` | BDIX indexer.                               |
 
 BDIX sources are only reachable from supported Bangladeshi ISPs and are hidden by
 default (`bdix_enabled` in config; `/enable-bdix`).

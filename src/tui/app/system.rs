@@ -109,6 +109,7 @@ impl App {
                     self.state.show_help = !self.state.show_help;
                     if self.state.show_help {
                         self.state.show_theme_popup = false;
+                        self.state.show_browse_popup = false;
                         self.state.tv_config_popup = false;
                         self.state.player_picker_popup = false;
                         self.state.subtitle_popup = false;
@@ -126,6 +127,16 @@ impl App {
                         self.state
                             .set_status("Reloading TV playlists...".to_string(), 150);
                         self.reload_tv_playlists();
+                    } else if let Some(preset) = self.state.active_browse_preset {
+                        self.state.is_loading = true;
+                        self.state
+                            .set_status(format!("Reloading {}...", preset.label()), 150);
+                        self.action_sender
+                            .send(Action::FetchHomepage {
+                                tab_id: "2".to_string(),
+                                page: 1,
+                            })
+                            .ok();
                     } else if !query.is_empty() {
                         self.action_sender
                             .send(Action::Search {
@@ -192,6 +203,7 @@ impl App {
                 self.state.image_cache.clear();
                 self.state.search_posters.clear();
                 self.state.search_poster_protocols.clear();
+                self.state.browse_metrics.clear();
                 self.state.preview_cache.clear();
                 self.state.poster_image = None;
                 self.state.poster_protocol = None;
@@ -254,6 +266,23 @@ impl App {
                     }
                 } else {
                     self.state.show_theme_popup = false;
+                }
+            }
+
+            Action::ShowBrowseMenu => {
+                if self.state.is_tv_mode
+                    || self.state.active_provider
+                        != crate::providers::models::ProviderKind::MovieBox
+                {
+                    self.state.set_status(
+                        "Browse is available only with the MovieBox provider.".to_string(),
+                        180,
+                    );
+                } else {
+                    self.reset_transient_overlays();
+                    self.state.show_browse_popup = true;
+                    self.state.browse_list_state.select(Some(0));
+                    self.state.input_mode = crate::tui::state::InputMode::Normal;
                 }
             }
 
