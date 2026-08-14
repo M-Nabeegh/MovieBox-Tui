@@ -6,6 +6,7 @@ use std::{
     str::FromStr,
 };
 
+use percent_encoding::percent_decode_str;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteConnectOptions;
 use thiserror::Error;
@@ -131,7 +132,7 @@ pub enum ConfigError {
     MissingFile(&'static str),
     #[error("{0} contains no usable secret data")]
     EmptySecret(&'static str),
-    #[error("{0} must not be group- or world-writable")]
+    #[error("{0} must be owner-readable only")]
     UnsafeSecretPermissions(&'static str),
     #[error("{0} must be less than or equal to 1080")]
     InvalidMaximumHeight(&'static str),
@@ -164,9 +165,53 @@ fn parse_bind_addr(value: &str) -> Result<SocketAddr, ConfigError> {
 }
 
 fn parse_database_url(value: &str) -> Result<String, ConfigError> {
+    if !value.starts_with("sqlite://") && !value.starts_with("sqlite:") {
+        return Err(ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"));
+    }
+
     SqliteConnectOptions::from_str(value)
-        .map(|_| value.to_string())
-        .map_err(|_| ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"))
+        .map_err(|_| ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"))?;
+
+    let database_part = value
+        .strip_prefix("sqlite://")
+        .or_else(|| value.strip_prefix("sqlite:"))
+        .ok_or(ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"))?;
+    let database_part = database_part
+        .split_once('?')
+        .map_or(database_part, |(path, _)| path);
+    let database_path = percent_decode_str(database_part)
+        .decode_utf8()
+        .map_err(|_| ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"))?;
+    let database_path = Path::new(database_path.as_ref());
+
+    if database_path.as_os_str().is_empty()
+        || database_path == Path::new(":memory:")
+        || !database_path.is_absolute()
+        || database_path == Path::new("/")
+        || database_path.starts_with("/mnt/mac-remote")
+    {
+        return Err(ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"));
+    }
+
+    let parameters = value
+        .split_once('?')
+        .map(|(_, parameters)| parameters)
+        .unwrap_or_default();
+    if url::form_urlencoded::parse(parameters.as_bytes())
+        .any(|(key, value)| key == "mode" && value == "memory")
+    {
+        return Err(ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"));
+    }
+
+    let parent = database_path
+        .parent()
+        .ok_or(ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"))?;
+    validate_directory("MOVIEBOX_DATABASE_URL", parent)?;
+    if database_path.exists() && !database_path.is_file() {
+        return Err(ConfigError::InvalidDatabaseUrl("MOVIEBOX_DATABASE_URL"));
+    }
+
+    Ok(value.to_string())
 }
 
 fn validate_directory(var: &'static str, path: &Path) -> Result<PathBuf, ConfigError> {
@@ -206,7 +251,7 @@ fn validate_secret_file(var: &'static str, path: &Path) -> Result<PathBuf, Confi
             .map_err(|_| ConfigError::UnreadableSecret(var))?
             .permissions()
             .mode();
-        if mode & 0o022 != 0 {
+        if mode & 0o077 != 0 {
             return Err(ConfigError::UnsafeSecretPermissions(var));
         }
     }

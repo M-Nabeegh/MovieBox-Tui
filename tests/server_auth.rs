@@ -162,6 +162,74 @@ async fn logout_rejects_mismatched_origin_and_missing_csrf_token() {
 }
 
 #[tokio::test]
+async fn origin_validation_matches_effective_ports_and_ipv6_hosts() {
+    let context = TestContext::new("fixture-secret").await;
+    let password = json!({
+        "password": "fixture-secret"
+    });
+
+    let non_default = context
+        .post_json_with_host_origin(
+            "/api/auth/login",
+            password.clone(),
+            "moviebox.example.ts.net:8443",
+            "https://moviebox.example.ts.net:8443",
+        )
+        .await;
+    assert_eq!(non_default.status(), StatusCode::NO_CONTENT);
+
+    let omitted_origin_default = context
+        .post_json_with_host_origin(
+            "/api/auth/login",
+            password.clone(),
+            "moviebox.example.ts.net:443",
+            "https://moviebox.example.ts.net",
+        )
+        .await;
+    assert_eq!(omitted_origin_default.status(), StatusCode::NO_CONTENT);
+
+    let omitted_host_default = context
+        .post_json_with_host_origin(
+            "/api/auth/login",
+            password.clone(),
+            "moviebox.example.ts.net",
+            "https://moviebox.example.ts.net:443",
+        )
+        .await;
+    assert_eq!(omitted_host_default.status(), StatusCode::NO_CONTENT);
+
+    let mismatched_port = context
+        .post_json_with_host_origin(
+            "/api/auth/login",
+            password.clone(),
+            "moviebox.example.ts.net:9443",
+            "https://moviebox.example.ts.net:8443",
+        )
+        .await;
+    assert_eq!(mismatched_port.status(), StatusCode::FORBIDDEN);
+
+    let mismatched_hostname = context
+        .post_json_with_host_origin(
+            "/api/auth/login",
+            password.clone(),
+            "moviebox.example.ts.net:8443",
+            "https://other.example.ts.net:8443",
+        )
+        .await;
+    assert_eq!(mismatched_hostname.status(), StatusCode::FORBIDDEN);
+
+    let ipv6 = context
+        .post_json_with_host_origin(
+            "/api/auth/login",
+            password,
+            "[::1]:8443",
+            "https://[::1]:8443",
+        )
+        .await;
+    assert_eq!(ipv6.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn expired_sessions_are_rejected_and_do_not_leak_internal_details() {
     let context = TestContext::new("fixture-secret").await;
 
@@ -213,14 +281,50 @@ async fn configuration_validation_rejects_invalid_bind_paths_and_secret_permissi
     {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::set_permissions(
-            context.session_key_file(),
-            fs::Permissions::from_mode(0o666),
-        )
-        .unwrap();
+        for (path, mode, variable) in [
+            (
+                context.password_file(),
+                0o644,
+                "MOVIEBOX_ADMIN_PASSWORD_FILE",
+            ),
+            (
+                context.session_key_file(),
+                0o640,
+                "MOVIEBOX_SESSION_KEY_FILE",
+            ),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 
-        let error = ServerConfig::from_map(context.env_map()).unwrap_err();
-        assert!(error.to_string().contains("MOVIEBOX_SESSION_KEY_FILE"));
+            let error = ServerConfig::from_map(context.env_map()).unwrap_err();
+            assert!(error.to_string().contains(variable));
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn configuration_rejects_memory_and_unsafe_database_paths() {
+    let context = TestContext::new("fixture-secret").await;
+
+    for database_url in [
+        "sqlite::memory:".to_string(),
+        "sqlite:///".to_string(),
+        "sqlite:///server.sqlite3".to_string(),
+        "sqlite:///mnt/mac-remote/server.sqlite3".to_string(),
+        format!(
+            "sqlite://{}",
+            context
+                .root()
+                .join("missing-parent")
+                .join("server.sqlite3")
+                .display()
+        ),
+    ] {
+        let mut env = context.env_map();
+        env.insert("MOVIEBOX_DATABASE_URL".to_string(), database_url);
+        let error = ServerConfig::from_map(env).unwrap_err();
+        assert!(error.to_string().contains("MOVIEBOX_DATABASE_URL"));
     }
 }
 
@@ -404,13 +508,24 @@ impl TestContext {
     }
 
     async fn post_json_with_origin(&self, uri: &str, body: Value, origin: &str) -> Response<Body> {
+        self.post_json_with_host_origin(uri, body, "moviebox.example.ts.net", origin)
+            .await
+    }
+
+    async fn post_json_with_host_origin(
+        &self,
+        uri: &str,
+        body: Value,
+        host: &str,
+        origin: &str,
+    ) -> Response<Body> {
         self.app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(uri)
-                    .header(HOST, "moviebox.example.ts.net")
+                    .header(HOST, host)
                     .header(ORIGIN, origin)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))

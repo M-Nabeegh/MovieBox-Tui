@@ -16,6 +16,7 @@ use rand::RngExt;
 use sha2::Sha256;
 use sqlx::{Row, SqlitePool};
 use time::{Duration, OffsetDateTime};
+use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::server::{
@@ -221,19 +222,18 @@ impl AuthService {
     ) -> Result<(), ApiError> {
         let origin = origin.ok_or_else(ApiError::invalid_origin)?;
         let host = host.ok_or_else(ApiError::invalid_origin)?;
-        let parsed = url::Url::parse(origin).map_err(|_| ApiError::invalid_origin())?;
-        let expected_host = host.trim();
-        let actual_host = parsed.host_str().ok_or_else(ApiError::invalid_origin)?;
-        if parsed.scheme() != "https" || !actual_host.eq_ignore_ascii_case(expected_host) {
+        let parsed_origin = Url::parse(origin).map_err(|_| ApiError::invalid_origin())?;
+        if parsed_origin.scheme() != "https" {
             return Err(ApiError::invalid_origin());
         }
-        if let Some(port) = parsed.port() {
-            let host_port = expected_host
-                .split_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok());
-            if host_port != Some(port) {
-                return Err(ApiError::invalid_origin());
-            }
+
+        let expected = parse_host_header(host).ok_or_else(ApiError::invalid_origin)?;
+        let actual_host = parsed_origin.host().ok_or_else(ApiError::invalid_origin)?;
+        let expected_host = expected.host().ok_or_else(ApiError::invalid_origin)?;
+        if !hosts_match(actual_host, expected_host)
+            || effective_port(&parsed_origin) != effective_port(&expected)
+        {
+            return Err(ApiError::invalid_origin());
         }
         Ok(())
     }
@@ -371,6 +371,40 @@ fn split_session_cookie(cookie: &str) -> Result<(String, String), ApiError> {
         return Err(ApiError::authentication_required());
     }
     Ok((session_id.to_string(), token.to_string()))
+}
+
+fn parse_host_header(host: &str) -> Option<Url> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+
+    let parsed = Url::parse(&format!("https://{host}")).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    parsed.host()?;
+    Some(parsed)
+}
+
+fn hosts_match(actual: Host<&str>, expected: Host<&str>) -> bool {
+    match (actual, expected) {
+        (Host::Domain(actual), Host::Domain(expected)) => actual.eq_ignore_ascii_case(expected),
+        (Host::Ipv4(actual), Host::Ipv4(expected)) => actual == expected,
+        (Host::Ipv6(actual), Host::Ipv6(expected)) => actual == expected,
+        _ => false,
+    }
+}
+
+fn effective_port(url: &Url) -> Option<u16> {
+    url.port().or_else(|| match url.scheme() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    })
 }
 
 fn prune_failures(entry: &mut VecDeque<OffsetDateTime>, now: OffsetDateTime) {
