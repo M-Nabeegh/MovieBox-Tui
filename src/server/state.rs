@@ -57,8 +57,10 @@ impl AppState {
         let download_client = DownloadClient::new().map_err(|error| {
             ServerError::Startup(format!("download client initialization failed: {error}"))
         })?;
+        let store = Arc::new(self.inner.jobs.clone());
+        let media_root = namer.media_root().to_path_buf();
         let worker = JobWorker::new(
-            Arc::new(self.inner.jobs.clone()),
+            Arc::clone(&store),
             Arc::clone(&self.inner.catalog),
             Arc::new(HttpTransferClient::new(download_client)),
             namer,
@@ -67,8 +69,23 @@ impl AppState {
         .with_reserve_bytes(self.inner.config.reserve_bytes);
 
         tokio::spawn(async move {
-            if let Err(error) = worker.run(CancellationToken::new()).await {
-                eprintln!("[moviebox-server] job worker stopped: {error}");
+            loop {
+                if let Err(error) = worker.run(CancellationToken::new()).await {
+                    eprintln!("[moviebox-server] job worker stopped: {error}; restarting");
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        match recover_interrupted_jobs(store.as_ref(), &media_root).await {
+                            Ok(()) => break,
+                            Err(error) => {
+                                eprintln!(
+                                    "[moviebox-server] job recovery before worker restart failed: {error}"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
             }
         });
         Ok(())
