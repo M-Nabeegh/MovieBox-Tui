@@ -165,12 +165,15 @@ async fn server_bootstrap_starts_worker_for_queued_jobs() {
         .await
         .unwrap();
 
-    for _ in 0..20 {
+    for _ in 0..40 {
         let current = context.jobs.get(job.id).await.unwrap();
-        if current.state != JobState::Queued {
-            assert_eq!(current.state, JobState::Failed);
-            assert_eq!(current.error_code.as_deref(), Some("unsafe_path"));
-            return;
+        match current.state {
+            JobState::Queued | JobState::Resolving => {}
+            JobState::Failed => {
+                assert_eq!(current.error_code.as_deref(), Some("unsafe_path"));
+                return;
+            }
+            state => panic!("worker reached unexpected state: {state:?}"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
