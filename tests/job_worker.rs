@@ -24,8 +24,9 @@ use moviebox_tui::{
         events::JobEventBus,
         jobs::{
             DownloadJob, JobEvent, JobEventKind, JobId, JobProgress, JobRepositoryError, JobState,
-            JobStatePatch, JobStore, JobWorker, TransferClient, TransferError, TransferProgress,
-            WorkerRunOutcome, recover_interrupted_jobs,
+            JobStatePatch, JobStore, JobWorker, MAX_AUTOMATIC_ATTEMPTS, TransferClient,
+            TransferError, TransferProgress, WorkerRunOutcome, recover_interrupted_jobs,
+            sweep_orphaned_partials,
         },
         library::LibraryNamer,
     },
@@ -136,6 +137,36 @@ impl TransferClient for FailingTransfer {
     }
 }
 
+/// Records how many times the worker asked the media server to rescan.
+#[derive(Debug, Default)]
+struct CountingRefresher {
+    calls: AtomicUsize,
+}
+
+impl CountingRefresher {
+    fn count(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl moviebox_tui::server::jobs::LibraryRefresher for CountingRefresher {
+    async fn refresh(&self) -> Result<(), ()> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn resolved_source(url: &str, expected_size: Option<u64>) -> ResolvedSource {
+    ResolvedSource {
+        url: url.parse().expect("fixture url is valid"),
+        headers: Default::default(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct MockStore {
     jobs: Arc<Mutex<HashMap<JobId, DownloadJob>>>,
@@ -170,9 +201,11 @@ impl JobStore for MockStore {
     async fn claim_next(&self) -> Result<Option<DownloadJob>, JobRepositoryError> {
         self.claims.fetch_add(1, Ordering::Relaxed);
         let mut jobs = self.jobs.lock().await;
+        let now = OffsetDateTime::now_utc();
         let next_id = jobs
             .values()
             .filter(|job| job.state == JobState::Queued)
+            .filter(|job| job.next_attempt_at.is_none_or(|due| due <= now))
             .min_by_key(|job| (job.created_at, job.id.to_string()))
             .map(|job| job.id);
 
@@ -183,6 +216,7 @@ impl JobStore for MockStore {
         let job = jobs.get_mut(&id).unwrap();
         job.state = JobState::Resolving;
         job.attempt += 1;
+        job.next_attempt_at = None;
         job.updated_at = OffsetDateTime::now_utc();
         job.version += 1;
         Ok(Some(job.clone()))
@@ -289,6 +323,9 @@ impl JobStore for MockStore {
         if let Some(value) = patch.warning {
             job.warning = value;
         }
+        if let Some(value) = patch.next_attempt_at {
+            job.next_attempt_at = value;
+        }
         job.updated_at = OffsetDateTime::now_utc();
         job.version += 1;
         Ok(job.clone())
@@ -324,6 +361,7 @@ fn build_job(root: &Path, seed: &str, state: JobState) -> DownloadJob {
         error_code: None,
         error_message: None,
         warning: None,
+        next_attempt_at: None,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
         version: 0,
@@ -365,6 +403,64 @@ impl WorkerHarness {
         JobWorker::new(store, catalog, Arc::new(transfer), self.namer.clone(), bus)
             .with_disk_space_checker(disk)
     }
+}
+
+#[tokio::test]
+async fn sweep_reclaims_partials_from_jobs_that_can_no_longer_resume() {
+    let harness = WorkerHarness::new();
+    let abandoned = build_job(&harness.media_root, "abandoned", JobState::Failed);
+    let active = build_job(&harness.media_root, "active", JobState::Downloading);
+
+    let abandoned_dir = harness
+        .media_root
+        .join("_moviebox")
+        .join("jobs")
+        .join(abandoned.id.to_string());
+    let active_dir = harness
+        .media_root
+        .join("_moviebox")
+        .join("jobs")
+        .join(active.id.to_string());
+    fs::write(abandoned_dir.join("video.mkv.part.0"), vec![0_u8; 5000])
+        .await
+        .unwrap();
+    fs::write(active_dir.join("video.mkv.part.0"), vec![0_u8; 1000])
+        .await
+        .unwrap();
+
+    let store = MockStore::with_jobs([abandoned.clone(), active.clone()]);
+    let reclaimed = sweep_orphaned_partials(&store, harness.namer.media_root())
+        .await
+        .unwrap();
+
+    assert_eq!(reclaimed, 5000);
+    assert!(!abandoned_dir.exists());
+    assert!(
+        active_dir.join("video.mkv.part.0").exists(),
+        "a resumable job must keep its partial data"
+    );
+}
+
+#[tokio::test]
+async fn sweep_ignores_directories_that_are_not_job_ids() {
+    let harness = WorkerHarness::new();
+    let unrelated = harness
+        .media_root
+        .join("_moviebox")
+        .join("jobs")
+        .join("notes");
+    fs::create_dir_all(&unrelated).await.unwrap();
+    fs::write(unrelated.join("keep.txt"), b"keep me")
+        .await
+        .unwrap();
+
+    let store = MockStore::default();
+    let reclaimed = sweep_orphaned_partials(&store, harness.namer.media_root())
+        .await
+        .unwrap();
+
+    assert_eq!(reclaimed, 0);
+    assert!(unrelated.join("keep.txt").exists());
 }
 
 #[tokio::test]
@@ -455,10 +551,197 @@ async fn transfer_failure_after_progress_does_not_stop_worker_on_version_conflic
         WorkerRunOutcome::Progressed
     );
 
+    // A transfer error is recoverable while attempts remain, so the job returns
+    // to the queue behind a backoff instead of ending.
+    let requeued = store.job(job.id).await;
+    assert_eq!(requeued.state, JobState::Queued);
+    assert_eq!(requeued.downloaded_bytes, 1);
+    assert_eq!(requeued.error_code.as_deref(), Some("download_failed"));
+    assert!(requeued.next_attempt_at.is_some());
+}
+
+#[tokio::test]
+async fn transfer_failure_keeps_partial_bytes_for_the_next_attempt() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "keep-partial", JobState::Queued);
+    let partial = harness
+        .media_root
+        .join(job.partial_video_path.trim_end_matches(".part"));
+    fs::create_dir_all(partial.parent().unwrap()).await.unwrap();
+    fs::write(&partial, vec![7_u8; 4096]).await.unwrap();
+
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(resolved_source(
+        "http://127.0.0.1:1/download",
+        Some(10),
+    ))]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
+    assert_eq!(store.job(job.id).await.state, JobState::Queued);
+    assert!(
+        partial.exists(),
+        "a retryable failure must not discard downloaded bytes"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_attempts_fail_the_job_and_reclaim_the_partials() {
+    let harness = WorkerHarness::new();
+    let mut job = build_job(&harness.media_root, "exhausted", JobState::Queued);
+    // `claim_next` increments the attempt counter, so this claim spends the last
+    // permitted attempt.
+    job.attempt = MAX_AUTOMATIC_ATTEMPTS;
+    let partial_dir = harness
+        .media_root
+        .join("_moviebox")
+        .join("jobs")
+        .join(job.id.to_string());
+    fs::create_dir_all(&partial_dir).await.unwrap();
+    fs::write(partial_dir.join("segment.part.0"), vec![1_u8; 2048])
+        .await
+        .unwrap();
+
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(resolved_source(
+        "http://127.0.0.1:1/download",
+        Some(10),
+    ))]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
     let failed = store.job(job.id).await;
     assert_eq!(failed.state, JobState::Failed);
-    assert_eq!(failed.downloaded_bytes, 1);
     assert_eq!(failed.error_code.as_deref(), Some("download_failed"));
+    assert!(
+        !partial_dir.exists(),
+        "a terminally failed job must not leave gigabytes of segments behind"
+    );
+}
+
+#[tokio::test]
+async fn transient_resolve_failure_requeues_instead_of_failing() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "resolve-flap", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Err(CatalogError::Provider(
+        "upstream 502".to_string(),
+    ))]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
+    let requeued = store.job(job.id).await;
+    assert_eq!(requeued.state, JobState::Queued);
+    assert_eq!(
+        requeued.error_code.as_deref(),
+        Some("source_resolve_failed")
+    );
+    assert!(requeued.next_attempt_at.is_some());
+}
+
+#[tokio::test]
+async fn permanent_resolve_failure_fails_immediately() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "resolve-gone", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Err(CatalogError::NotFound("source"))]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
+    let failed = store.job(job.id).await;
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("source_resolve_failed"));
+    assert!(
+        failed.next_attempt_at.is_none(),
+        "a permanent failure must not be scheduled for another attempt"
+    );
+}
+
+#[tokio::test]
+async fn completed_job_triggers_a_single_library_refresh() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let job = build_job(&harness.media_root, "refresh", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: Some(server.content_len() as u64),
+    })]));
+    let library = Arc::new(CountingRefresher::default());
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(moviebox_tui::server::jobs::HttpTransferClient::new(
+            server.client(),
+        )),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)))
+    .with_library_refresher(library.clone());
+
+    worker.run_once().await.unwrap();
+
+    assert_eq!(store.job(job.id).await.state, JobState::Ready);
+    assert_eq!(library.count(), 1);
+}
+
+#[tokio::test]
+async fn failed_job_does_not_trigger_a_library_refresh() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "no-refresh", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Err(CatalogError::NotFound("source"))]));
+    let library = Arc::new(CountingRefresher::default());
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)))
+    .with_library_refresher(library.clone());
+
+    worker.run_once().await.unwrap();
+
+    assert_eq!(store.job(job.id).await.state, JobState::Failed);
+    assert_eq!(library.count(), 0);
 }
 
 #[tokio::test]

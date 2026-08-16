@@ -18,10 +18,13 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use time::OffsetDateTime;
+
 use super::{
     DownloadJob, JobEvent, JobEventKind, JobId, JobProgress, JobRepository, JobRepositoryError,
     JobState,
-    recovery::{fail_job, validate_job_partial_path},
+    recovery::{fail_job, job_partial_dir, validate_job_partial_path},
+    retry::{backoff_delay, classify_catalog_error, may_retry},
 };
 use crate::{
     catalog::{CatalogError, CatalogProvider, QualityPolicy, ResolvedSource, SubtitleId},
@@ -33,6 +36,10 @@ const DEFAULT_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const IDLE_WAIT: Duration = Duration::from_millis(250);
 const WARNING_THROTTLE: Duration = Duration::from_secs(5 * 60);
 
+/// Signed catalog URLs expire on a timer, so a large download can outlive several
+/// of them. Each expiry costs one re-resolve rather than the whole transfer.
+const MAX_URL_REFRESHES: u8 = 5;
+
 #[derive(Debug, Clone, Default)]
 pub struct JobStatePatch {
     pub downloaded_bytes: Option<u64>,
@@ -41,6 +48,7 @@ pub struct JobStatePatch {
     pub error_code: Option<Option<String>>,
     pub error_message: Option<Option<String>>,
     pub warning: Option<Option<String>>,
+    pub next_attempt_at: Option<Option<OffsetDateTime>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +116,26 @@ impl TransferClient for HttpTransferClient {
 
         watcher.abort();
         result
+    }
+}
+
+/// Notifies the media server that new files are on disk.
+///
+/// The worker only knows that a job finished; how the library is told, and which
+/// credential that needs, stays behind this trait so no secret reaches the worker.
+#[async_trait]
+pub trait LibraryRefresher: Send + Sync {
+    async fn refresh(&self) -> Result<(), ()>;
+}
+
+/// Used when no media server is configured.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopLibraryRefresher;
+
+#[async_trait]
+impl LibraryRefresher for NoopLibraryRefresher {
+    async fn refresh(&self) -> Result<(), ()> {
+        Ok(())
     }
 }
 
@@ -245,19 +273,40 @@ pub enum WorkerRunOutcome {
     Deferred,
 }
 
-#[derive(Clone)]
-pub struct JobWorker<S, C, T, D = SystemDiskSpaceChecker> {
+pub struct JobWorker<S, C, T, D = SystemDiskSpaceChecker, L = NoopLibraryRefresher>
+where
+    L: ?Sized,
+{
     store: Arc<S>,
     catalog: Arc<C>,
     transfer: Arc<T>,
     namer: LibraryNamer,
     bus: JobEventBus,
     disk: Arc<D>,
+    library: Arc<L>,
     reserve_bytes: u64,
     throttled_warnings: Arc<Mutex<HashMap<JobId, Instant>>>,
 }
 
-impl<S, C, T> JobWorker<S, C, T, SystemDiskSpaceChecker>
+// Derived `Clone` would demand `L: Clone`, which an `Arc<dyn LibraryRefresher>`
+// cannot satisfy; every field is already cheap to clone behind an `Arc`.
+impl<S, C, T, D, L: ?Sized> Clone for JobWorker<S, C, T, D, L> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            catalog: Arc::clone(&self.catalog),
+            transfer: Arc::clone(&self.transfer),
+            namer: self.namer.clone(),
+            bus: self.bus.clone(),
+            disk: Arc::clone(&self.disk),
+            library: Arc::clone(&self.library),
+            reserve_bytes: self.reserve_bytes,
+            throttled_warnings: Arc::clone(&self.throttled_warnings),
+        }
+    }
+}
+
+impl<S, C, T> JobWorker<S, C, T, SystemDiskSpaceChecker, NoopLibraryRefresher>
 where
     S: JobStore + 'static,
     C: CatalogProvider + 'static,
@@ -277,20 +326,22 @@ where
             namer,
             bus,
             disk: Arc::new(SystemDiskSpaceChecker),
+            library: Arc::new(NoopLibraryRefresher),
             reserve_bytes: DEFAULT_RESERVE_BYTES,
             throttled_warnings: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-impl<S, C, T, D> JobWorker<S, C, T, D>
+impl<S, C, T, D, L> JobWorker<S, C, T, D, L>
 where
     S: JobStore + 'static,
     C: CatalogProvider + 'static,
     T: TransferClient + 'static,
     D: DiskSpaceChecker + 'static,
+    L: LibraryRefresher + ?Sized + 'static,
 {
-    pub fn with_disk_space_checker<D2>(self, disk: Arc<D2>) -> JobWorker<S, C, T, D2>
+    pub fn with_disk_space_checker<D2>(self, disk: Arc<D2>) -> JobWorker<S, C, T, D2, L>
     where
         D2: DiskSpaceChecker + 'static,
     {
@@ -301,6 +352,24 @@ where
             namer: self.namer,
             bus: self.bus,
             disk,
+            library: self.library,
+            reserve_bytes: self.reserve_bytes,
+            throttled_warnings: self.throttled_warnings,
+        }
+    }
+
+    pub fn with_library_refresher<L2>(self, library: Arc<L2>) -> JobWorker<S, C, T, D, L2>
+    where
+        L2: LibraryRefresher + ?Sized + 'static,
+    {
+        JobWorker {
+            store: self.store,
+            catalog: self.catalog,
+            transfer: self.transfer,
+            namer: self.namer,
+            bus: self.bus,
+            disk: self.disk,
+            library,
             reserve_bytes: self.reserve_bytes,
             throttled_warnings: self.throttled_warnings,
         }
@@ -373,16 +442,16 @@ where
                 self.publish(&self.store.get(job.id).await?, JobEventKind::StateChanged);
                 return Ok(WorkerRunOutcome::Progressed);
             }
-            Err(_) => {
-                fail_job(
-                    self.store.as_ref(),
-                    job.id,
-                    job.version,
+            Err(error) => {
+                // A provider outage must not destroy a partially downloaded job:
+                // reschedule it and leave the bytes already on disk untouched.
+                self.give_up_or_reschedule(
+                    &job,
+                    &error,
                     "source_resolve_failed",
                     "source resolution failed",
                 )
                 .await?;
-                self.publish(&self.store.get(job.id).await?, JobEventKind::StateChanged);
                 return Ok(WorkerRunOutcome::Progressed);
             }
         };
@@ -407,7 +476,13 @@ where
         }
 
         let available = self.disk.available_bytes(self.namer.media_root()).await?;
-        let expected_size = resolved.expected_size.unwrap_or(0);
+        // Bytes already written for this job are on the same filesystem, so only
+        // the remainder still has to fit. Charging the full size again would
+        // stall a nearly finished resume behind a space check it cannot pass.
+        let expected_size = resolved
+            .expected_size
+            .unwrap_or(0)
+            .saturating_sub(self.partial_bytes_on_disk(&job).await);
         if available <= self.reserve_bytes.saturating_add(expected_size) {
             let requeued = self
                 .store
@@ -466,6 +541,34 @@ where
             .await?;
         self.publish(&finalized, JobEventKind::StateChanged);
 
+        // A transfer that ends early still reports the bytes it wrote, so compare
+        // the file on disk against the expected length before publishing it.
+        // Handing a truncated movie to the media library looks like success and
+        // is only discovered when someone tries to watch it.
+        if !self.transferred_size_matches(&finalized).await? {
+            if may_retry(finalized.attempt) {
+                self.reschedule(
+                    &finalized,
+                    "incomplete_download",
+                    "downloaded size mismatch",
+                )
+                .await?;
+            } else {
+                fail_job(
+                    self.store.as_ref(),
+                    finalized.id,
+                    finalized.version,
+                    "incomplete_download",
+                    "downloaded size mismatch",
+                )
+                .await?;
+                let failed = self.store.get(finalized.id).await?;
+                self.discard_partials(&failed).await;
+                self.publish(&failed, JobEventKind::StateChanged);
+            }
+            return Ok(WorkerRunOutcome::Progressed);
+        }
+
         self.finalize_video(&finalized).await?;
         let subtitle_warning = self
             .finalize_subtitle_if_needed(&finalized, job.subtitle_id.as_ref())
@@ -496,8 +599,31 @@ where
                 Some(JobEvent::new(JobEventKind::StateChanged)),
             )
             .await?;
+        self.discard_partials(&ready).await;
         self.publish(&ready, JobEventKind::StateChanged);
+        // Best effort: the files are already in place, so a media server that is
+        // down or unconfigured must not turn a finished download into a failure.
+        let _ = self.library.refresh().await;
         Ok(WorkerRunOutcome::Progressed)
+    }
+
+    /// Whether the transferred file matches the length the source advertised.
+    ///
+    /// Sources that omit a length cannot be checked this way, so they pass.
+    async fn transferred_size_matches(&self, job: &DownloadJob) -> Result<bool, WorkerError> {
+        let Some(expected) = job.total_bytes else {
+            return Ok(true);
+        };
+        let transferred =
+            self.contained_path(&active_transfer_path(&job.partial_video_path).ok_or_else(
+                || JobRepositoryError::InvalidData("partial video path must end with .part".into()),
+            )?)?;
+        let actual = match fs::metadata(&transferred).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(WorkerError::Io(error)),
+        };
+        Ok(actual == expected)
     }
 
     async fn download_with_refresh(
@@ -515,9 +641,8 @@ where
             fs::create_dir_all(parent).await?;
         }
 
-        let mut attempts = 0_u8;
+        let mut refreshes = 0_u8;
         loop {
-            attempts += 1;
             let token = CancellationToken::new();
 
             let request = build_request(&resolved);
@@ -540,34 +665,53 @@ where
                     self.publish(&paused, JobEventKind::StateChanged);
                     return Ok(None);
                 }
+                // The signed URL aged out mid-transfer. Re-sign it and continue
+                // from the bytes already on disk rather than starting over.
                 Err(TransferError::Download(DownloadError::Http(status)))
-                    if attempts == 1 && is_expired_status(status) =>
+                    if refreshes < MAX_URL_REFRESHES && is_expired_status(status) =>
                 {
+                    refreshes += 1;
                     resolved = match self
                         .catalog
                         .resolve(&downloading.source_id, downloading.subtitle_id.as_ref())
                         .await
                     {
                         Ok(value) => value,
-                        Err(_) => {
-                            self.fail_current_job(
-                                downloading.id,
-                                "download_failed",
-                                "download request failed",
-                            )
-                            .await?;
+                        Err(error) => {
+                            let current = self.store.get(downloading.id).await?;
+                            if current.state == JobState::Downloading {
+                                self.give_up_or_reschedule(
+                                    &current,
+                                    &error,
+                                    "download_failed",
+                                    "download request failed",
+                                )
+                                .await?;
+                            }
                             return Ok(None);
                         }
                     };
                 }
                 Err(error) => {
+                    // The transfer layer already exhausted its own in-place
+                    // retries, so hand the job back to the queue with a backoff
+                    // instead of throwing away the bytes it managed to fetch.
                     let _ = error;
-                    self.fail_current_job(
-                        downloading.id,
-                        "download_failed",
-                        "download request failed",
-                    )
-                    .await?;
+                    let current = self.store.get(downloading.id).await?;
+                    if current.state != JobState::Downloading {
+                        return Ok(None);
+                    }
+                    if may_retry(current.attempt) {
+                        self.reschedule(&current, "download_failed", "download request failed")
+                            .await?;
+                    } else {
+                        self.fail_current_job(
+                            downloading.id,
+                            "download_failed",
+                            "download request failed",
+                        )
+                        .await?;
+                    }
                     return Ok(None);
                 }
             }
@@ -817,8 +961,89 @@ where
             return Ok(());
         }
         fail_job(self.store.as_ref(), job_id, current.version, code, message).await?;
-        self.publish(&self.store.get(job_id).await?, JobEventKind::StateChanged);
+        let failed = self.store.get(job_id).await?;
+        self.discard_partials(&failed).await;
+        self.publish(&failed, JobEventKind::StateChanged);
         Ok(())
+    }
+
+    /// Reschedule a recoverable failure, or fail the job once the attempt budget
+    /// is spent. Partial data survives a reschedule and is removed on failure.
+    async fn give_up_or_reschedule(
+        &self,
+        job: &DownloadJob,
+        error: &CatalogError,
+        code: &'static str,
+        message: &'static str,
+    ) -> Result<(), WorkerError> {
+        let recoverable = classify_catalog_error(error).is_transient() && may_retry(job.attempt);
+        if !recoverable {
+            fail_job(self.store.as_ref(), job.id, job.version, code, message).await?;
+            let failed = self.store.get(job.id).await?;
+            self.discard_partials(&failed).await;
+            self.publish(&failed, JobEventKind::StateChanged);
+            return Ok(());
+        }
+
+        self.reschedule(job, code, message).await
+    }
+
+    /// Return a job to the queue with a backoff so the next claim is delayed.
+    async fn reschedule(
+        &self,
+        job: &DownloadJob,
+        code: &'static str,
+        message: &'static str,
+    ) -> Result<(), WorkerError> {
+        let due = OffsetDateTime::now_utc() + backoff_delay(job.attempt);
+        let requeued = self
+            .store
+            .force_state(
+                job.id,
+                job.version,
+                JobState::Queued,
+                JobEventKind::StateChanged,
+                JobStatePatch {
+                    speed_bytes_per_second: Some(None),
+                    error_code: Some(Some(code.to_string())),
+                    error_message: Some(Some(message.to_string())),
+                    next_attempt_at: Some(Some(due)),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        self.publish(&requeued, JobEventKind::StateChanged);
+        Ok(())
+    }
+
+    /// Remove the job's scratch directory once it can no longer be resumed.
+    ///
+    /// Segment files for a multi-gigabyte transfer are themselves multi-gigabyte,
+    /// so leaving them behind on a terminal failure silently consumes the disk.
+    async fn discard_partials(&self, job: &DownloadJob) {
+        let Ok(directory) = job_partial_dir(self.namer.media_root(), job.id) else {
+            return;
+        };
+        let _ = fs::remove_dir_all(directory).await;
+    }
+
+    /// Total bytes already staged in the job's scratch directory.
+    async fn partial_bytes_on_disk(&self, job: &DownloadJob) -> u64 {
+        let Ok(directory) = job_partial_dir(self.namer.media_root(), job.id) else {
+            return 0;
+        };
+        let Ok(mut entries) = fs::read_dir(&directory).await else {
+            return 0;
+        };
+        let mut total = 0_u64;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(metadata) = entry.metadata().await
+                && metadata.is_file()
+            {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+        total
     }
 
     fn publish(&self, job: &DownloadJob, kind: JobEventKind) {

@@ -8,8 +8,11 @@ use crate::server::{
     config::ServerConfig,
     error::ServerError,
     events::JobEventBus,
-    jobs::{HttpTransferClient, JobRepository, JobWorker, recover_interrupted_jobs},
-    library::LibraryNamer,
+    jobs::{
+        HttpTransferClient, JobRepository, JobWorker, LibraryRefresher, NoopLibraryRefresher,
+        recover_interrupted_jobs, sweep_orphaned_partials,
+    },
+    library::{LibraryNamer, jellyfin::JellyfinClient},
 };
 use crate::{
     catalog::moviebox::MovieBoxCatalogProvider,
@@ -54,11 +57,23 @@ impl AppState {
         recover_interrupted_jobs(&self.inner.jobs, namer.media_root())
             .await
             .map_err(|error| ServerError::Startup(format!("job recovery failed: {error}")))?;
+        // Recovery runs first so that anything still resumable is back in the
+        // queue before the sweep decides what counts as abandoned.
+        match sweep_orphaned_partials(&self.inner.jobs, namer.media_root()).await {
+            Ok(0) => {}
+            Ok(reclaimed) => {
+                eprintln!("[moviebox-server] reclaimed {reclaimed} bytes of abandoned partials");
+            }
+            Err(error) => {
+                eprintln!("[moviebox-server] partial sweep failed: {error}");
+            }
+        }
         let download_client = DownloadClient::new().map_err(|error| {
             ServerError::Startup(format!("download client initialization failed: {error}"))
         })?;
         let store = Arc::new(self.inner.jobs.clone());
         let media_root = namer.media_root().to_path_buf();
+        let library = self.library_refresher();
         let worker = JobWorker::new(
             Arc::clone(&store),
             Arc::clone(&self.inner.catalog),
@@ -66,29 +81,43 @@ impl AppState {
             namer,
             self.inner.events.clone(),
         )
-        .with_reserve_bytes(self.inner.config.reserve_bytes);
+        .with_reserve_bytes(self.inner.config.reserve_bytes)
+        .with_library_refresher(library);
 
         tokio::spawn(async move {
-            loop {
-                if let Err(error) = worker.run(CancellationToken::new()).await {
-                    eprintln!("[moviebox-server] job worker stopped: {error}; restarting");
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        match recover_interrupted_jobs(store.as_ref(), &media_root).await {
-                            Ok(()) => break,
-                            Err(error) => {
-                                eprintln!(
-                                    "[moviebox-server] job recovery before worker restart failed: {error}"
-                                );
-                            }
+            while let Err(error) = worker.run(CancellationToken::new()).await {
+                eprintln!("[moviebox-server] job worker stopped: {error}; restarting");
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    match recover_interrupted_jobs(store.as_ref(), &media_root).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            eprintln!(
+                                "[moviebox-server] job recovery before worker restart failed: {error}"
+                            );
                         }
                     }
-                } else {
-                    break;
                 }
             }
         });
         Ok(())
+    }
+
+    /// Build the media-library notifier the worker calls when a job completes.
+    ///
+    /// A missing or unreadable API key is not fatal: downloads still finish and
+    /// land in the media folders, they just wait for Jellyfin's own scan.
+    fn library_refresher(&self) -> Arc<dyn LibraryRefresher> {
+        match JellyfinClient::from_config(&self.inner.config) {
+            Ok(client) if client.is_configured() => Arc::new(client),
+            Ok(_) => Arc::new(NoopLibraryRefresher),
+            Err(error) => {
+                eprintln!(
+                    "[moviebox-server] Jellyfin refresh disabled: {error}; downloads will rely on scheduled scans"
+                );
+                Arc::new(NoopLibraryRefresher)
+            }
+        }
     }
 
     fn from_provider(

@@ -101,11 +101,13 @@ impl JobRepository {
                 state = ?1,
                 updated_at = ?2,
                 version = version + 1,
-                attempt = attempt + 1
+                attempt = attempt + 1,
+                next_attempt_at = NULL
             WHERE id = (
                 SELECT id
                 FROM jobs
                 WHERE state = ?3
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
                 ORDER BY created_at ASC, id ASC
                 LIMIT 1
             )
@@ -154,6 +156,9 @@ impl JobRepository {
 
         let now = now_millis()?;
         let event_fields = apply_event_fields(to, current.warning.as_deref(), event.as_ref())?;
+        // A user-driven resume or retry should start immediately and receive a
+        // fresh budget of automatic attempts, so clear any pending backoff.
+        let restarting = to == JobState::Queued;
         let row = sqlx::query(
             r#"
             UPDATE jobs
@@ -163,8 +168,10 @@ impl JobRepository {
                 error_message = ?3,
                 warning = ?4,
                 updated_at = ?5,
+                attempt = CASE WHEN ?6 THEN 0 ELSE attempt END,
+                next_attempt_at = CASE WHEN ?6 THEN NULL ELSE next_attempt_at END,
                 version = version + 1
-            WHERE id = ?6 AND version = ?7
+            WHERE id = ?7 AND version = ?8
             RETURNING *
             "#,
         )
@@ -173,6 +180,7 @@ impl JobRepository {
         .bind(event_fields.error_message)
         .bind(event_fields.warning)
         .bind(now)
+        .bind(restarting)
         .bind(id.to_string())
         .bind(expected_version)
         .fetch_optional(&mut *tx)
@@ -292,6 +300,7 @@ impl JobRepository {
         let error_code = patch.error_code.unwrap_or(current.error_code);
         let error_message = patch.error_message.unwrap_or(current.error_message);
         let warning = patch.warning.unwrap_or(current.warning);
+        let next_attempt_at = patch.next_attempt_at.unwrap_or(current.next_attempt_at);
         let row = sqlx::query(
             r#"
             UPDATE jobs
@@ -303,9 +312,10 @@ impl JobRepository {
                 error_code = ?5,
                 error_message = ?6,
                 warning = ?7,
-                updated_at = ?8,
+                next_attempt_at = ?8,
+                updated_at = ?9,
                 version = version + 1
-            WHERE id = ?9 AND version = ?10
+            WHERE id = ?10 AND version = ?11
             RETURNING *
             "#,
         )
@@ -316,6 +326,7 @@ impl JobRepository {
         .bind(error_code)
         .bind(error_message)
         .bind(warning)
+        .bind(next_attempt_at.map(to_millis).transpose()?)
         .bind(now_millis()?)
         .bind(id.to_string())
         .bind(expected_version)
@@ -468,6 +479,10 @@ fn job_from_row(row: &SqliteRow) -> Result<DownloadJob, JobRepositoryError> {
         error_code: row.get::<Option<String>, _>("error_code"),
         error_message: row.get::<Option<String>, _>("error_message"),
         warning: row.get::<Option<String>, _>("warning"),
+        next_attempt_at: row
+            .get::<Option<i64>, _>("next_attempt_at")
+            .map(from_millis)
+            .transpose()?,
         created_at: from_millis(row.get::<i64, _>("created_at"))?,
         updated_at: from_millis(row.get::<i64, _>("updated_at"))?,
         version: row.get::<i64, _>("version"),

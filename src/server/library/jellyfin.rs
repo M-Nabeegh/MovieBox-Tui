@@ -90,6 +90,11 @@ impl JellyfinClient {
         }
     }
 
+    /// Whether a credential is configured, and so whether a refresh can do anything.
+    pub fn is_configured(&self) -> bool {
+        self.api_key.is_some()
+    }
+
     pub async fn find_item(
         &self,
         title: &str,
@@ -178,6 +183,17 @@ pub enum JellyfinError {
     InvalidBaseUrl,
     #[error("Jellyfin API key could not be loaded")]
     SecretUnavailable,
+}
+
+/// Adapts the Jellyfin client to the worker's library-refresh port.
+///
+/// The worker holds only this handle, so the API key stays inside the client and
+/// is never passed through job state, events, or logs.
+#[async_trait::async_trait]
+impl crate::server::jobs::LibraryRefresher for JellyfinClient {
+    async fn refresh(&self) -> Result<(), ()> {
+        self.refresh_library().await.map_err(|_| ())
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -186,7 +186,7 @@ async fn migration_creates_tables_and_indexes() {
     assert!(names.contains(&"job_events".to_string()));
     assert!(names.contains(&"sessions".to_string()));
     assert!(names.contains(&"users".to_string()));
-    assert!(names.contains(&"idx_jobs_state_created_at".to_string()));
+    assert!(names.contains(&"idx_jobs_state_next_attempt_at".to_string()));
     assert!(names.contains(&"idx_sessions_expires_at".to_string()));
 }
 

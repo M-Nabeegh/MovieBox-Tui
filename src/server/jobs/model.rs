@@ -123,6 +123,9 @@ pub struct DownloadJob {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub warning: Option<String>,
+    /// When set, the job is queued but must not be claimed before this instant.
+    /// Used to back off between automatic retries of recoverable failures.
+    pub next_attempt_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub version: i64,

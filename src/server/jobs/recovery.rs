@@ -1,4 +1,9 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Component, Path, PathBuf},
+};
+
+use uuid::Uuid;
 
 use super::{
     DownloadJob, JobEventKind, JobId, JobRepositoryError, JobState, JobStatePatch, JobStore,
@@ -69,6 +74,87 @@ fn validate_paths(job: &DownloadJob, media_root: &Path) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+/// Absolute path of the scratch directory that holds a job's in-flight parts.
+pub(crate) fn job_partial_dir(media_root: &Path, job_id: JobId) -> Result<PathBuf, ()> {
+    contained_path(
+        media_root,
+        &Path::new("_moviebox").join("jobs").join(job_id.to_string()),
+    )
+    .map_err(|_| ())
+}
+
+/// Delete scratch directories that no longer belong to a resumable job.
+///
+/// Partial segments are only useful while the job that produced them can still
+/// continue. Anything left over from a job that finished, failed, was cancelled,
+/// or no longer exists is dead weight — and for large downloads that is gigabytes.
+pub async fn sweep_orphaned_partials<S>(
+    store: &S,
+    media_root: &Path,
+) -> Result<u64, JobRepositoryError>
+where
+    S: JobStore + ?Sized,
+{
+    let resumable: HashSet<String> = store
+        .list_all()
+        .await?
+        .into_iter()
+        .filter(|job| {
+            matches!(
+                job.state,
+                JobState::Queued
+                    | JobState::Resolving
+                    | JobState::Downloading
+                    | JobState::Paused
+                    | JobState::Finalizing
+            )
+        })
+        .map(|job| job.id.to_string())
+        .collect();
+
+    let Ok(root) = contained_path(media_root, &Path::new("_moviebox").join("jobs")) else {
+        return Ok(0);
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return Ok(0);
+    };
+
+    let mut reclaimed = 0_u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if resumable.contains(&name) {
+            continue;
+        }
+        // Only remove directories whose name is a job id we generated, so an
+        // unrelated file under the media root is never touched.
+        if Uuid::parse_str(&name).is_err() {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        reclaimed += directory_size(&entry.path()).await;
+        let _ = tokio::fs::remove_dir_all(entry.path()).await;
+    }
+
+    Ok(reclaimed)
+}
+
+async fn directory_size(path: &Path) -> u64 {
+    let Ok(mut entries) = tokio::fs::read_dir(path).await else {
+        return 0;
+    };
+    let mut total = 0_u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(metadata) = entry.metadata().await
+            && metadata.is_file()
+        {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 pub(crate) fn validate_job_partial_path(
