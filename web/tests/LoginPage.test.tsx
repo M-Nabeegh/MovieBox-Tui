@@ -16,7 +16,7 @@ test("submits the password and enters the authenticated shell", async () => {
     if (url.endsWith("/auth/session")) {
       sessionCalls += 1;
       if (sessionCalls === 1) return new Response(null, { status: 401 });
-      return json({ authenticated: true, username: "nabeegh", csrf_token: "csrf-fixture" });
+      return json({ authenticated: true, username: "admin", display_name: "Nabeegh", csrf_token: "csrf-fixture" });
     }
     if (url.includes("/discover")) return json([]);
     if (url.includes("/jobs")) return json([]);

@@ -68,7 +68,10 @@ fn asset_response(path: &str, fallback: bool) -> Response {
             "public, max-age=31536000, immutable"
         }),
     );
-    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"));
+    // Poster and backdrop artwork is served from TMDB's image CDN, so it has to
+    // be allowed explicitly; without it every card renders as an empty box.
+    // Only that one host is added — the policy stays closed to everything else.
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://image.tmdb.org; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     response

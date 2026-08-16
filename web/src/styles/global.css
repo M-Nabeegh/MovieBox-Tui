@@ -143,7 +143,9 @@ img {
   display: flex;
   align-items: flex-end;
   min-height: min(82vh, 760px);
-  padding: var(--space-8) var(--gutter) var(--space-7);
+  /* The generous bottom padding is what keeps the first row clear of the
+     buttons once it overlaps upward. */
+  padding: var(--space-8) var(--gutter) calc(var(--space-8) + var(--space-6));
   isolation: isolate;
 }
 
@@ -284,8 +286,9 @@ img {
   display: flex;
   flex-direction: column;
   gap: var(--space-7);
-  /* Pull the first row up over the hero fade, as streaming layouts do. */
-  margin-top: calc(var(--space-8) * -1);
+  /* Overlap the hero's fade slightly so the rows feel joined to it — but only
+     into the fade, never far enough to collide with the hero's buttons. */
+  margin-top: calc(var(--space-5) * -1);
   padding-bottom: var(--space-8);
 }
 
@@ -309,10 +312,17 @@ img {
   font-size: var(--step-small);
 }
 
+/* The viewport anchors the arrows; the scroller inside it does the moving. */
+.row-viewport {
+  position: relative;
+}
+
 .row-scroller {
   display: flex;
   gap: var(--row-gap);
-  padding: 0 var(--gutter) var(--space-4);
+  /* Vertical padding leaves room for the hover scale, which would otherwise be
+     clipped by this element's own overflow. */
+  padding: var(--space-3) var(--gutter) var(--space-4);
   overflow-x: auto;
   scroll-behavior: smooth;
   scroll-snap-type: x proximity;
@@ -321,6 +331,46 @@ img {
 
 .row-scroller::-webkit-scrollbar {
   display: none;
+}
+
+.row-arrow {
+  position: absolute;
+  top: 0;
+  bottom: var(--space-4);
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  width: clamp(38px, var(--gutter), 64px);
+  color: var(--ink);
+  font-size: 2.2rem;
+  line-height: 1;
+  /* A gradient rather than a solid block: the row appears to fade under the
+     control instead of being covered by it. */
+  background: linear-gradient(90deg, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0));
+  opacity: 0;
+  transition: opacity var(--speed) var(--ease-out);
+}
+
+.row-arrow-prev {
+  left: 0;
+}
+
+.row-arrow-next {
+  right: 0;
+  background: linear-gradient(270deg, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0));
+}
+
+/* Revealed on approach, as streaming rows do, but always available to keyboard
+   users and on touch, where there is no hover to trigger them. */
+.row-viewport:hover .row-arrow,
+.row-arrow:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .row-arrow {
+    opacity: 1;
+  }
 }
 
 /* ------------------------------------------------------------------ cards */
@@ -352,7 +402,12 @@ img {
 }
 
 .card-body {
+  display: block;
   padding: var(--space-3);
+  /* Reserve room for two lines of title plus the meta row, so a long title
+     cannot be clipped by the card's own overflow, and every card in a row
+     keeps the same height regardless of title length. */
+  min-height: 76px;
 }
 
 .card-title {
@@ -672,4 +727,49 @@ img {
     padding: var(--space-4);
     margin-top: -32px;
   }
+}
+
+/* --------------------------------------------------------------- verifying */
+
+/* Artwork and provider metadata shown together before a download is chosen, so
+   a mismatched title is obvious rather than discovered gigabytes later. */
+.verify {
+  display: flex;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+
+.verify-art {
+  flex: 0 0 auto;
+  width: 84px;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+}
+
+.verify-label {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: var(--step-tiny);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.verify-title {
+  margin: 2px 0 var(--space-2);
+  font-size: var(--step-row);
+  font-weight: 700;
+}
+
+.verify-synopsis {
+  margin: var(--space-2) 0 0;
+  color: var(--ink-muted);
+  font-size: var(--step-small);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }

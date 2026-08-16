@@ -23,15 +23,16 @@ export function PosterCard({
           decoding="async"
         />
       )}
-      <div className="card-body">
-        <p className="card-title">{title.title}</p>
-        <div className="card-meta">
+      {/* Spans, not paragraphs: a button may only contain phrasing content. */}
+      <span className="card-body">
+        <span className="card-title">{title.title}</span>
+        <span className="card-meta">
           {title.year && <span>{title.year}</span>}
           {title.rating != null && (
             <span className="rating">{title.rating.toFixed(1)}</span>
           )}
-        </div>
-      </div>
+        </span>
+      </span>
     </button>
   );
 }

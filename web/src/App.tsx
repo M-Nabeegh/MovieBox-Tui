@@ -82,7 +82,7 @@ function Shell({ session, signOut }: { session: Session; signOut: () => Promise<
         signOut={signOut}
       />
       {view === "browse" ? (
-        <BrowsePage name={session.username} query={query} onSelect={setSelected} />
+        <BrowsePage name={session.display_name} query={query} onSelect={setSelected} />
       ) : (
         <div style={{ paddingTop: 96 }}>
           <QueuePage key={queueVersion} />

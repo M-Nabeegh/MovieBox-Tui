@@ -46,6 +46,9 @@ pub struct ServerConfig {
     pub notify_webhook_url_file: Option<PathBuf>,
     /// Name used to address the notification, e.g. "Hey Nabeegh, ...".
     pub notify_recipient: Option<String>,
+    /// Name shown in the interface. Falls back to the notification recipient,
+    /// since both answer the same question: what to call this person.
+    pub display_name: Option<String>,
     /// Where tapping the notification should take the viewer.
     pub notify_link_url: Option<Url>,
     pub log_format: LogFormat,
@@ -108,6 +111,11 @@ impl ServerConfig {
             .get("MOVIEBOX_NOTIFY_RECIPIENT")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let display_name = env
+            .get("MOVIEBOX_DISPLAY_NAME")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| notify_recipient.clone());
         let notify_link_url = env
             .get("MOVIEBOX_NOTIFY_LINK_URL")
             .map(String::as_str)
@@ -143,6 +151,7 @@ impl ServerConfig {
             tmdb_token_file,
             notify_webhook_url_file,
             notify_recipient,
+            display_name,
             notify_link_url,
             log_format,
             subtitle_preference,

@@ -1,8 +1,16 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
-import type { DiscoverTitle, SourceOption } from "../../api/types";
+import type { CatalogDetails, DiscoverTitle, SourceOption } from "../../api/types";
+import { findMatch } from "./match";
 
-type Match = { catalogId: string; sources: SourceOption[] };
+type Match = {
+  catalogId: string;
+  matchedTitle: string;
+  matchedYear: string | null;
+  /** What the download catalogue itself says about the matched entry. */
+  details: CatalogDetails | null;
+  sources: SourceOption[];
+};
 
 /** Human-readable file size. */
 function formatSize(bytes: number | null) {
@@ -20,20 +28,32 @@ const QUALITY_COPY: Record<SourceOption["quality"], string> = {
 /**
  * Browsing runs on the metadata catalogue, but downloads come from the source
  * provider, so a chosen title has to be matched across before it can be queued.
- * The match is by title and year, which is what the provider indexes on.
+ *
+ * If no confident match exists the request fails. Falling back to the closest
+ * search result would silently download a different film — a franchise sibling
+ * is not a near-miss, it is the wrong movie.
  */
 async function findSources(title: DiscoverTitle): Promise<Match> {
   const page = await api.catalog.search(title.title);
-  const wanted = title.title.trim().toLowerCase();
-  const exact = page.items.find(
-    (item) =>
-      item.title.trim().toLowerCase() === wanted &&
-      (!title.year || !item.year || item.year === title.year),
-  );
-  const candidate = exact ?? page.items[0];
-  if (!candidate) throw new Error("No downloadable source was found for this title.");
-  const sources = await api.catalog.sources(candidate.id);
-  return { catalogId: candidate.id, sources };
+  const matched = findMatch(title, page.items);
+  if (!matched) {
+    throw new Error(
+      `“${title.title}”${title.year ? ` (${title.year})` : ""} is not in the download catalogue yet.`,
+    );
+  }
+  // Details come from the download catalogue, not the browse one, so the two
+  // descriptions can be compared before committing to gigabytes.
+  const [sources, details] = await Promise.all([
+    api.catalog.sources(matched.id),
+    api.catalog.details(matched.id).catch(() => null),
+  ]);
+  return {
+    catalogId: matched.id,
+    matchedTitle: matched.title,
+    matchedYear: matched.year,
+    details,
+    sources,
+  };
 }
 
 export function TitleModal({
@@ -120,6 +140,37 @@ export function TitleModal({
 
           {match && (
             <div className="source-list">
+              {/* Show the matched entry as the download catalogue describes it.
+                  A wrong match is only dangerous while it stays invisible, so
+                  the artwork and the provider's own metadata are put in front of
+                  the user before any source can be chosen. */}
+              <div className="verify">
+                {title.poster_url && (
+                  <img className="verify-art" src={title.poster_url} alt="" />
+                )}
+                <div>
+                  <p className="verify-label">About to download</p>
+                  <p className="verify-title">
+                    {match.matchedTitle}
+                    {match.matchedYear ? ` (${match.matchedYear})` : ""}
+                  </p>
+                  {match.details && (
+                    <p className="card-meta">
+                      {[
+                        match.details.duration,
+                        match.details.genres.slice(0, 3).join(", ") || null,
+                        match.details.country,
+                        match.details.imdb_rating ? `IMDb ${match.details.imdb_rating}` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </p>
+                  )}
+                  {match.details?.description && (
+                    <p className="verify-synopsis">{match.details.description}</p>
+                  )}
+                </div>
+              </div>
               {match.sources.map((source) => (
                 <button
                   key={source.id}

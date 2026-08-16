@@ -29,6 +29,9 @@ struct LoginRequest {
 struct SessionResponse {
     authenticated: bool,
     username: String,
+    /// What to call the signed-in person in the interface. The account name is
+    /// a login credential, not a name worth greeting somebody by.
+    display_name: String,
     csrf_token: String,
 }
 
@@ -91,9 +94,15 @@ async fn session(State(state): State<AppState>, headers: HeaderMap) -> Result<Re
         .auth()
         .authenticate(state.pool(), header_str_name(&headers, "cookie"))
         .await?;
+    let display_name = state
+        .config()
+        .display_name
+        .clone()
+        .unwrap_or_else(|| session.username.clone());
     let body = Json(SessionResponse {
         authenticated: true,
         username: session.username,
+        display_name,
         csrf_token: session.csrf_token,
     });
     let mut response = body.into_response();

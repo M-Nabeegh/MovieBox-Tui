@@ -1,4 +1,5 @@
 import type {
+  CatalogDetails,
   ApiRequestInit,
   CreateJobRequest,
   DiscoverRow,
@@ -55,6 +56,8 @@ export const api = {
       api.request<SourceOption[]>(
         `/catalog/items/moviebox/${encodeURIComponent(catalogId)}/sources`,
       ),
+    details: (catalogId: string) =>
+      api.request<CatalogDetails>(`/catalog/items/moviebox/${encodeURIComponent(catalogId)}`),
   },
 
   createJob: (body: CreateJobRequest) =>

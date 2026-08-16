@@ -9,7 +9,7 @@ function json(body: unknown, status = 200) {
   });
 }
 
-const session = { authenticated: true, username: "nabeegh", csrf_token: "csrf-fixture" };
+const session = { authenticated: true, username: "admin", display_name: "Nabeegh", csrf_token: "csrf-fixture" };
 
 const rows = [
   {
