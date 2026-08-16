@@ -116,5 +116,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 [dev-dependencies]
 assert_cmd = "2.1.1"
 tempfile = "3.23.0"
+# `test-util` provides the paused clock used to assert the worker idles cheaply.
+tokio = { version = "1.52.3", features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 wiremock = "0.6.5"

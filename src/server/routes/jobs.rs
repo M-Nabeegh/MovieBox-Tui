@@ -249,6 +249,7 @@ pub(crate) async fn enqueue_download(
         .await
         .map_err(|_| ApiError::internal())?;
     state.events().publish_job(&job, JobEventKind::Created);
+    state.signal().wake();
     Ok(job)
 }
 
@@ -304,6 +305,11 @@ async fn transition(
         .await
         .map_err(map_job_error)?;
     state.events().publish_job(&job, JobEventKind::StateChanged);
+    // Resume and retry put the job back in the queue, so start it immediately
+    // rather than leaving it for the next poll.
+    if to == JobState::Queued {
+        state.signal().wake();
+    }
     private_json(JobDto::from(job))
 }
 

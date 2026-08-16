@@ -36,6 +36,8 @@ The server enforces a 1080p maximum, one download worker, and a 10 GiB free-spac
 
 Downloads recover from interruptions rather than restarting: transient provider failures and expired source links are retried with backoff while partial data is kept, completed files are size-verified before reaching the library, and abandoned partials are reclaimed. English subtitles are attached automatically (`MOVIEBOX_SUBTITLE_LANGUAGE`), and Jellyfin is asked to rescan when a download finishes. See [server downloads](docs/server/downloads.md).
 
+Optional [completion notifications](docs/server/notifications.md) push a "ready to watch" message to your phone the moment a download lands.
+
 An optional [MCP endpoint](docs/server/mcp.md) lets an agent search the catalog and queue downloads for you. It is disabled until you configure a bearer token, and it reuses the same quality, storage, and safety rules as the browser UI.
 
 Quick start from the repository root:

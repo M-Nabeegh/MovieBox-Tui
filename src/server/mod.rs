@@ -5,6 +5,7 @@ pub mod error;
 pub mod events;
 pub mod jobs;
 pub mod library;
+pub mod notify;
 pub mod routes;
 pub mod security;
 pub mod state;

@@ -29,11 +29,22 @@ use super::{
 use crate::{
     catalog::{CatalogError, CatalogProvider, QualityPolicy, ResolvedSource, SubtitleId},
     download::{DownloadClient, DownloadError, DownloadOutcome, DownloadRequest, download},
-    server::{events::JobEventBus, library::LibraryNamer, security::path::contained_path},
+    server::{
+        events::JobEventBus,
+        library::LibraryNamer,
+        notify::{DownloadNotifier, NoopNotifier},
+        security::path::contained_path,
+    },
 };
 
 const DEFAULT_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const IDLE_WAIT: Duration = Duration::from_millis(250);
+
+/// Fallback poll interval for an idle worker.
+///
+/// New work arrives through [`JobSignal`], so this only has to catch jobs whose
+/// retry backoff has elapsed and cover a missed wakeup. Polling faster than this
+/// would burn CPU around the clock on a server that is usually doing nothing.
+const IDLE_WAIT: Duration = Duration::from_secs(5);
 const WARNING_THROTTLE: Duration = Duration::from_secs(5 * 60);
 
 /// Signed catalog URLs expire on a timer, so a large download can outlive several
@@ -116,6 +127,34 @@ impl TransferClient for HttpTransferClient {
 
         watcher.abort();
         result
+    }
+}
+
+/// Wakes an idle worker the moment there is something to do.
+///
+/// Without this the worker could only discover new work by polling, which costs
+/// CPU continuously on a server that is idle almost all of the time. Queueing a
+/// job signals the worker directly, so it can afford to sleep between checks and
+/// still start immediately.
+#[derive(Debug, Clone, Default)]
+pub struct JobSignal {
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl JobSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Announce that a job may now be claimable.
+    pub fn wake(&self) {
+        // A permit is stored when no worker is waiting, so work queued mid-run
+        // is picked up on the next loop rather than waiting for the poll.
+        self.notify.notify_one();
+    }
+
+    async fn wait(&self) {
+        self.notify.notified().await;
     }
 }
 
@@ -284,6 +323,10 @@ where
     bus: JobEventBus,
     disk: Arc<D>,
     library: Arc<L>,
+    // Kept as a trait object rather than another generic parameter: it is called
+    // once per finished download, so dispatch cost is irrelevant here.
+    notifier: Arc<dyn DownloadNotifier>,
+    signal: JobSignal,
     reserve_bytes: u64,
     throttled_warnings: Arc<Mutex<HashMap<JobId, Instant>>>,
 }
@@ -300,6 +343,8 @@ impl<S, C, T, D, L: ?Sized> Clone for JobWorker<S, C, T, D, L> {
             bus: self.bus.clone(),
             disk: Arc::clone(&self.disk),
             library: Arc::clone(&self.library),
+            notifier: Arc::clone(&self.notifier),
+            signal: self.signal.clone(),
             reserve_bytes: self.reserve_bytes,
             throttled_warnings: Arc::clone(&self.throttled_warnings),
         }
@@ -327,6 +372,8 @@ where
             bus,
             disk: Arc::new(SystemDiskSpaceChecker),
             library: Arc::new(NoopLibraryRefresher),
+            notifier: Arc::new(NoopNotifier),
+            signal: JobSignal::new(),
             reserve_bytes: DEFAULT_RESERVE_BYTES,
             throttled_warnings: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -353,6 +400,8 @@ where
             bus: self.bus,
             disk,
             library: self.library,
+            notifier: self.notifier,
+            signal: self.signal.clone(),
             reserve_bytes: self.reserve_bytes,
             throttled_warnings: self.throttled_warnings,
         }
@@ -370,9 +419,23 @@ where
             bus: self.bus,
             disk: self.disk,
             library,
+            notifier: self.notifier,
+            signal: self.signal,
             reserve_bytes: self.reserve_bytes,
             throttled_warnings: self.throttled_warnings,
         }
+    }
+
+    /// Share the signal that wakes this worker when a job is queued.
+    pub fn with_signal(mut self, signal: JobSignal) -> Self {
+        self.signal = signal;
+        self
+    }
+
+    /// Announce finished downloads through the given notifier.
+    pub fn with_notifier(mut self, notifier: Arc<dyn DownloadNotifier>) -> Self {
+        self.notifier = notifier;
+        self
     }
 
     pub fn with_reserve_bytes(mut self, reserve_bytes: u64) -> Self {
@@ -392,8 +455,11 @@ where
                 WorkerRunOutcome::NoJob => {}
             }
 
+            // Sleep until there is a reason to look again: a newly queued job
+            // signals directly, and the timer only has to catch retry backoffs.
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
+                _ = self.signal.wait() => {}
                 _ = tokio::time::sleep(IDLE_WAIT) => {}
             }
         }
@@ -604,6 +670,9 @@ where
         // Best effort: the files are already in place, so a media server that is
         // down or unconfigured must not turn a finished download into a failure.
         let _ = self.library.refresh().await;
+        self.notifier
+            .notify_ready(&ready.title, ready.year.as_deref())
+            .await;
         Ok(WorkerRunOutcome::Progressed)
     }
 

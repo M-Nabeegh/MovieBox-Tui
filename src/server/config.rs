@@ -40,6 +40,12 @@ pub struct ServerConfig {
     pub jellyfin_api_key_file: Option<PathBuf>,
     /// Bearer token for the MCP endpoint. Unset leaves the endpoint disabled.
     pub mcp_token_file: Option<PathBuf>,
+    /// Webhook posted when a download is ready. Unset disables notifications.
+    pub notify_webhook_url_file: Option<PathBuf>,
+    /// Name used to address the notification, e.g. "Hey Nabeegh, ...".
+    pub notify_recipient: Option<String>,
+    /// Where tapping the notification should take the viewer.
+    pub notify_link_url: Option<Url>,
     pub log_format: LogFormat,
     /// Language attached automatically when a download names no subtitle.
     pub subtitle_preference: SubtitlePreference,
@@ -93,6 +99,21 @@ impl ServerConfig {
             parse_jellyfin_base_url(required_var(&env, "MOVIEBOX_JELLYFIN_BASE_URL")?)?;
         let jellyfin_api_key_file = optional_secret_file(&env, "MOVIEBOX_JELLYFIN_API_KEY_FILE")?;
         let mcp_token_file = optional_secret_file(&env, "MOVIEBOX_MCP_TOKEN_FILE")?;
+        let notify_webhook_url_file =
+            optional_secret_file(&env, "MOVIEBOX_NOTIFY_WEBHOOK_URL_FILE")?;
+        let notify_recipient = env
+            .get("MOVIEBOX_NOTIFY_RECIPIENT")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let notify_link_url = env
+            .get("MOVIEBOX_NOTIFY_LINK_URL")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                Url::parse(value).map_err(|_| ConfigError::InvalidUrl("MOVIEBOX_NOTIFY_LINK_URL"))
+            })
+            .transpose()?;
         let log_format = parse_log_format(required_var(&env, "MOVIEBOX_LOG_FORMAT")?)?;
         // Optional: unset means the default (English); `off` disables it.
         let subtitle_preference = env
@@ -116,11 +137,31 @@ impl ServerConfig {
             jellyfin_base_url,
             jellyfin_api_key_file,
             mcp_token_file,
+            notify_webhook_url_file,
+            notify_recipient,
+            notify_link_url,
             log_format,
             subtitle_preference,
             session_cookie_name: COOKIE_NAME.to_string(),
             session_pepper,
         })
+    }
+
+    /// Read the completion webhook URL, or `None` when notifications are off.
+    pub fn read_notify_webhook_url(&self) -> Result<Option<String>, ConfigError> {
+        self.notify_webhook_url_file
+            .as_deref()
+            .map(|path| {
+                let url = fs::read_to_string(path).map_err(|_| {
+                    ConfigError::UnreadableSecret("MOVIEBOX_NOTIFY_WEBHOOK_URL_FILE")
+                })?;
+                let url = url.trim();
+                if url.is_empty() {
+                    return Err(ConfigError::EmptySecret("MOVIEBOX_NOTIFY_WEBHOOK_URL_FILE"));
+                }
+                Ok(url.to_string())
+            })
+            .transpose()
     }
 
     /// Read the MCP bearer token, or `None` when the endpoint is disabled.
@@ -187,6 +228,8 @@ pub enum ConfigError {
     InvalidReserve(&'static str),
     #[error("{0} must be text or json")]
     InvalidLogFormat(&'static str),
+    #[error("{0} must be an absolute URL")]
+    InvalidUrl(&'static str),
     #[error("{0} must be http or https and target loopback or the jellyfin service")]
     InvalidJellyfinBaseUrl(&'static str),
     #[error("{0} could not be read safely")]

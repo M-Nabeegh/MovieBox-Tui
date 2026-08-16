@@ -158,6 +158,28 @@ impl moviebox_tui::server::jobs::LibraryRefresher for CountingRefresher {
     }
 }
 
+/// Captures what the worker announced, so tests can assert on the message.
+#[derive(Debug, Default)]
+struct RecordingNotifier {
+    sent: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl RecordingNotifier {
+    async fn sent(&self) -> Vec<(String, Option<String>)> {
+        self.sent.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl moviebox_tui::server::notify::DownloadNotifier for RecordingNotifier {
+    async fn notify_ready(&self, title: &str, year: Option<&str>) {
+        self.sent
+            .lock()
+            .await
+            .push((title.to_string(), year.map(str::to_string)));
+    }
+}
+
 fn resolved_source(url: &str, expected_size: Option<u64>) -> ResolvedSource {
     ResolvedSource {
         url: url.parse().expect("fixture url is valid"),
@@ -185,6 +207,10 @@ impl MockStore {
 
     fn claim_count(&self) -> usize {
         self.claims.load(Ordering::Relaxed)
+    }
+
+    async fn insert(&self, job: DownloadJob) {
+        self.jobs.lock().await.insert(job.id, job);
     }
 
     async fn job(&self, id: JobId) -> DownloadJob {
@@ -404,6 +430,80 @@ impl WorkerHarness {
         JobWorker::new(store, catalog, Arc::new(transfer), self.namer.clone(), bus)
             .with_disk_space_checker(disk)
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_worker_sleeps_instead_of_polling_in_a_tight_loop() {
+    let harness = WorkerHarness::new();
+    let store = Arc::new(MockStore::default());
+    let worker = JobWorker::new(
+        store.clone(),
+        Arc::new(MockCatalog::new([])),
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn({
+        let worker = worker.clone();
+        let cancel = cancel.clone();
+        async move { worker.run(cancel).await }
+    });
+
+    // An empty queue for a minute must not mean hundreds of database hits: the
+    // worker should wake only about once per idle interval.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    cancel.cancel();
+    let _ = running.await;
+
+    let claims = store.claim_count();
+    assert!(
+        claims <= 20,
+        "idle worker polled {claims} times in a minute; it should sleep between checks"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_work_wakes_the_worker_without_waiting_for_the_poll() {
+    let harness = WorkerHarness::new();
+    let store = Arc::new(MockStore::default());
+    let signal = moviebox_tui::server::jobs::JobSignal::new();
+    let worker = JobWorker::new(
+        store.clone(),
+        Arc::new(MockCatalog::new([Err(CatalogError::NotFound("source"))])),
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)))
+    .with_signal(signal.clone());
+
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn({
+        let worker = worker.clone();
+        let cancel = cancel.clone();
+        async move { worker.run(cancel).await }
+    });
+
+    // Let the worker settle into its idle wait, then queue work and signal it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let job = build_job(&harness.media_root, "signalled", JobState::Queued);
+    store.insert(job.clone()).await;
+    signal.wake();
+
+    // Far less than the idle interval: the job must start on the signal alone.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let claimed = store.job(job.id).await;
+    cancel.cancel();
+    let _ = running.await;
+
+    assert_ne!(
+        claimed.state,
+        JobState::Queued,
+        "a signalled job should start without waiting for the idle poll"
+    );
 }
 
 #[tokio::test]
@@ -811,6 +911,70 @@ async fn completed_job_triggers_a_single_library_refresh() {
 
     assert_eq!(store.job(job.id).await.state, JobState::Ready);
     assert_eq!(library.count(), 1);
+}
+
+#[tokio::test]
+async fn completed_job_announces_the_title_as_ready_to_watch() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let job = build_job(&harness.media_root, "notify", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: Some(server.content_len() as u64),
+    })]));
+    let notifier = Arc::new(RecordingNotifier::default());
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(moviebox_tui::server::jobs::HttpTransferClient::new(
+            server.client(),
+        )),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)))
+    .with_notifier(notifier.clone());
+
+    worker.run_once().await.unwrap();
+
+    assert_eq!(store.job(job.id).await.state, JobState::Ready);
+    let sent = notifier.sent().await;
+    assert_eq!(
+        sent.len(),
+        1,
+        "a finished download should notify exactly once"
+    );
+    assert_eq!(sent[0], (job.title.clone(), Some("2024".to_string())));
+}
+
+#[tokio::test]
+async fn failed_job_does_not_announce_anything() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "notify-failed", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Err(CatalogError::NotFound("source"))]));
+    let notifier = Arc::new(RecordingNotifier::default());
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(FailingTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)))
+    .with_notifier(notifier.clone());
+
+    worker.run_once().await.unwrap();
+
+    assert_eq!(store.job(job.id).await.state, JobState::Failed);
+    assert!(
+        notifier.sent().await.is_empty(),
+        "a failed download must not claim to be ready to watch"
+    );
 }
 
 #[tokio::test]

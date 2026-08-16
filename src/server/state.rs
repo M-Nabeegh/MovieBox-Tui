@@ -9,10 +9,11 @@ use crate::server::{
     error::ServerError,
     events::JobEventBus,
     jobs::{
-        HttpTransferClient, JobRepository, JobWorker, LibraryRefresher, NoopLibraryRefresher,
-        recover_interrupted_jobs, sweep_orphaned_partials,
+        HttpTransferClient, JobRepository, JobSignal, JobWorker, LibraryRefresher,
+        NoopLibraryRefresher, recover_interrupted_jobs, sweep_orphaned_partials,
     },
     library::{LibraryNamer, jellyfin::JellyfinClient},
+    notify::{DownloadNotifier, NoopNotifier, WebhookNotifier},
 };
 use crate::{
     catalog::moviebox::MovieBoxCatalogProvider,
@@ -33,6 +34,7 @@ struct AppStateInner {
     catalog: Arc<CatalogService>,
     jobs: JobRepository,
     events: JobEventBus,
+    signal: JobSignal,
 }
 
 impl AppState {
@@ -82,7 +84,9 @@ impl AppState {
             self.inner.events.clone(),
         )
         .with_reserve_bytes(self.inner.config.reserve_bytes)
-        .with_library_refresher(library);
+        .with_library_refresher(library)
+        .with_notifier(self.completion_notifier())
+        .with_signal(self.inner.signal.clone());
 
         tokio::spawn(async move {
             while let Err(error) = worker.run(CancellationToken::new()).await {
@@ -120,6 +124,21 @@ impl AppState {
         }
     }
 
+    /// Build the notifier that announces finished downloads.
+    ///
+    /// Notifications are a convenience, so a missing or malformed webhook only
+    /// disables them; downloads still complete normally.
+    fn completion_notifier(&self) -> Arc<dyn DownloadNotifier> {
+        match WebhookNotifier::from_config(&self.inner.config) {
+            Ok(Some(notifier)) => Arc::new(notifier),
+            Ok(None) => Arc::new(NoopNotifier),
+            Err(error) => {
+                eprintln!("[moviebox-server] completion notifications disabled: {error}");
+                Arc::new(NoopNotifier)
+            }
+        }
+    }
+
     fn from_provider(
         config: ServerConfig,
         pool: SqlitePool,
@@ -134,6 +153,7 @@ impl AppState {
                 auth,
                 catalog: Arc::new(CatalogService::new(provider)),
                 events: JobEventBus::default(),
+                signal: JobSignal::new(),
             }),
         })
     }
@@ -158,5 +178,9 @@ impl AppState {
     }
     pub fn events(&self) -> &JobEventBus {
         &self.inner.events
+    }
+    /// Wakes the download worker so queued work starts without waiting for a poll.
+    pub fn signal(&self) -> &JobSignal {
+        &self.inner.signal
     }
 }

@@ -14,6 +14,7 @@ pub use retry::{
     FailureClass, MAX_AUTOMATIC_ATTEMPTS, backoff_delay, classify_catalog_error, may_retry,
 };
 pub use worker::{
-    DiskSpaceChecker, HttpTransferClient, JobStatePatch, JobStore, JobWorker, LibraryRefresher,
-    NoopLibraryRefresher, TransferClient, TransferError, TransferProgress, WorkerRunOutcome,
+    DiskSpaceChecker, HttpTransferClient, JobSignal, JobStatePatch, JobStore, JobWorker,
+    LibraryRefresher, NoopLibraryRefresher, TransferClient, TransferError, TransferProgress,
+    WorkerRunOutcome,
 };
