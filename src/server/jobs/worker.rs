@@ -838,11 +838,12 @@ where
         let Some(subtitle_id) = subtitle_id else {
             return Ok(None);
         };
-        let Some(partial) = &job.partial_subtitle_path else {
-            return Ok(None);
-        };
-        let Some(final_subtitle) = &job.final_subtitle_path else {
-            return Ok(None);
+        // A job that asked for a subtitle but carries nowhere to put it would
+        // otherwise finish silently without one, which reads as success.
+        let (Some(partial), Some(final_subtitle)) =
+            (&job.partial_subtitle_path, &job.final_subtitle_path)
+        else {
+            return Ok(Some("subtitle_path_missing".to_string()));
         };
 
         self.validated_partial_path(job, partial)?;

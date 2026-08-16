@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use moviebox_tui::{
     catalog::{
         CatalogDetails, CatalogError, CatalogId, CatalogProvider, EpisodeRequest, MediaType,
-        ResolvedSource, SearchPage, SourceId, SourceOption, SubtitleId, SubtitleTrack,
+        ResolvedSource, ResolvedSubtitle, SearchPage, SourceId, SourceOption, SubtitleId,
+        SubtitleTrack,
     },
     download::{DownloadOutcome, DownloadRequest},
     server::{
@@ -687,6 +688,97 @@ async fn permanent_resolve_failure_fails_immediately() {
         failed.next_attempt_at.is_none(),
         "a permanent failure must not be scheduled for another attempt"
     );
+}
+
+#[tokio::test]
+async fn requested_subtitle_is_downloaded_next_to_the_video() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let mut job = build_job(&harness.media_root, "with-subs", JobState::Queued);
+    job.subtitle_id = Some(SubtitleId::new("subtitle-en".to_string()));
+    job.final_subtitle_path = Some(
+        job.final_video_path
+            .replace(".mkv", ".English.srt")
+            .to_string(),
+    );
+    job.partial_subtitle_path = Some(
+        job.partial_video_path
+            .replace(".mkv.part", ".English.srt.part")
+            .to_string(),
+    );
+
+    let with_subtitle = || ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: Some(ResolvedSubtitle {
+            url: server.url("/download"),
+            headers: FixtureServer::required_headers(),
+            language: "English".to_string(),
+            extension: "srt".to_string(),
+        }),
+        extension: "mkv".to_string(),
+        expected_size: Some(server.content_len() as u64),
+    };
+    // The worker resolves once to download the video and again for the subtitle.
+    let catalog = Arc::new(MockCatalog::new([Ok(with_subtitle()), Ok(with_subtitle())]));
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(moviebox_tui::server::jobs::HttpTransferClient::new(
+            server.client(),
+        )),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
+    let completed = store.job(job.id).await;
+    assert_eq!(completed.state, JobState::Ready);
+    assert_eq!(completed.warning, None);
+    let subtitle = harness
+        .media_root
+        .join(completed.final_subtitle_path.as_ref().unwrap());
+    assert!(
+        subtitle.exists(),
+        "a job carrying a subtitle must finalize it beside the video"
+    );
+}
+
+#[tokio::test]
+async fn subtitle_without_a_destination_warns_instead_of_silently_skipping() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let mut job = build_job(&harness.media_root, "orphan-subs", JobState::Queued);
+    // A subtitle was requested but no path was recorded for it.
+    job.subtitle_id = Some(SubtitleId::new("subtitle-en".to_string()));
+
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: Some(server.content_len() as u64),
+    })]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(moviebox_tui::server::jobs::HttpTransferClient::new(
+            server.client(),
+        )),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
+    let completed = store.job(job.id).await;
+    assert_eq!(completed.state, JobState::Ready);
+    assert_eq!(completed.warning.as_deref(), Some("subtitle_path_missing"));
 }
 
 #[tokio::test]

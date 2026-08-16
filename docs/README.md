@@ -38,6 +38,7 @@ remote deployment or verified hardware acceleration.
 | [server/architecture.md](server/architecture.md) | Services, data flow, ports |
 | [server/install.md](server/install.md) | Install, secrets, first run, private access |
 | [server/storage.md](server/storage.md) | Data root, mounts, media, disk reserve |
+| [server/downloads.md](server/downloads.md) | Job lifecycle, retries, subtitles, library refresh |
 | [server/security.md](server/security.md) | Authentication, exposure, secrets |
 | [server/backup-restore.md](server/backup-restore.md) | Backup and restore |
 | [server/troubleshooting.md](server/troubleshooting.md) | Health, logs, queue, Jellyfin |

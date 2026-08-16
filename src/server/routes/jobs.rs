@@ -4,7 +4,7 @@ use crate::{
     server::{
         error::ApiError,
         jobs::{JobEvent as RepoEvent, JobEventKind, JobId, JobState, NewJob},
-        library::{LibraryNamer, MediaIdentity},
+        library::{LibraryNamer, MediaIdentity, SubtitlePreference},
         state::AppState,
     },
 };
@@ -169,19 +169,40 @@ async fn create(
     if selected_source.height != request.requested_height {
         return Err(ApiError::quality_unavailable());
     }
-    let subtitle_for_resolution = request
-        .subtitle_id
-        .as_ref()
-        .map(|value| SubtitleId::new(value.clone()));
-    state
+    // Without an explicit choice, attach the preferred language automatically so
+    // a download does not quietly land in the library with no subtitle at all.
+    let subtitle_for_resolution = match &request.subtitle_id {
+        Some(value) => Some(SubtitleId::new(value.clone())),
+        None => auto_selected_subtitle(&state, &source_id).await,
+    };
+    let resolved = state
         .catalog()
         .resolve(&source_id, subtitle_for_resolution.as_ref())
         .await
         .map_err(map_catalog_error)?;
+    // A requested subtitle only gets downloaded if the job carries somewhere to
+    // put it, so derive its naming from what the source actually resolved to.
+    let subtitle_naming = resolved
+        .subtitle
+        .as_ref()
+        .map(|subtitle| (subtitle.language.as_str(), subtitle.extension.as_str()));
+    // An explicit choice that cannot be honoured is an error; an automatic one
+    // is only a convenience, so fall back to downloading the video alone.
+    if subtitle_naming.is_none() && request.subtitle_id.is_some() {
+        return Err(ApiError::new_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_subtitle",
+            "The selected subtitle is unavailable for this source.",
+        ));
+    }
+    let subtitle_id = subtitle_naming
+        .is_some()
+        .then_some(subtitle_for_resolution)
+        .flatten();
     let id = Uuid::new_v4();
     let namer = LibraryNamer::new(&state.config().media_root).map_err(|_| ApiError::internal())?;
     let paths = namer
-        .paths_for(&identity, "mkv", None, id)
+        .paths_for(&identity, "mkv", subtitle_naming, id)
         .map_err(|_| ApiError::internal())?;
     let job = state
         .jobs()
@@ -190,7 +211,7 @@ async fn create(
             NewJob {
                 catalog_id,
                 source_id,
-                subtitle_id: request.subtitle_id.map(SubtitleId::new),
+                subtitle_id,
                 title: details.title,
                 year: details.year,
                 media_type: details.media_type,
@@ -272,6 +293,20 @@ async fn transition(
         .map_err(map_job_error)?;
     state.events().publish_job(&job, JobEventKind::StateChanged);
     private_json(JobDto::from(job))
+}
+
+/// Pick a subtitle for a request that did not name one.
+///
+/// Best effort by design: if the provider cannot list subtitles, or offers
+/// nothing in the preferred language, the download proceeds without one rather
+/// than failing over a convenience feature.
+async fn auto_selected_subtitle(state: &AppState, source_id: &SourceId) -> Option<SubtitleId> {
+    let preference = &state.config().subtitle_preference;
+    if *preference == SubtitlePreference::Disabled {
+        return None;
+    }
+    let tracks = state.catalog().subtitles(source_id).await.ok()?;
+    preference.select(&tracks).map(|track| track.id.clone())
 }
 
 fn parse_id(value: &str) -> Result<JobId, ApiError> {

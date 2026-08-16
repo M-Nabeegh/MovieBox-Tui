@@ -12,6 +12,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use thiserror::Error;
 use url::{Host, Url};
 
+use crate::server::library::SubtitlePreference;
+
 const MINIMUM_RESERVE_GIB: u16 = 10;
 const COOKIE_NAME: &str = "moviebox_session";
 
@@ -37,6 +39,8 @@ pub struct ServerConfig {
     pub jellyfin_base_url: Url,
     pub jellyfin_api_key_file: Option<PathBuf>,
     pub log_format: LogFormat,
+    /// Language attached automatically when a download names no subtitle.
+    pub subtitle_preference: SubtitlePreference,
     pub session_cookie_name: String,
     pub session_pepper: [u8; 32],
 }
@@ -87,6 +91,11 @@ impl ServerConfig {
             parse_jellyfin_base_url(required_var(&env, "MOVIEBOX_JELLYFIN_BASE_URL")?)?;
         let jellyfin_api_key_file = optional_secret_file(&env, "MOVIEBOX_JELLYFIN_API_KEY_FILE")?;
         let log_format = parse_log_format(required_var(&env, "MOVIEBOX_LOG_FORMAT")?)?;
+        // Optional: unset means the default (English); `off` disables it.
+        let subtitle_preference = env
+            .get("MOVIEBOX_SUBTITLE_LANGUAGE")
+            .map(|value| SubtitlePreference::parse(value))
+            .unwrap_or_default();
         let session_pepper = derive_session_pepper(&session_key_file)?;
 
         Ok(Self {
@@ -104,6 +113,7 @@ impl ServerConfig {
             jellyfin_base_url,
             jellyfin_api_key_file,
             log_format,
+            subtitle_preference,
             session_cookie_name: COOKIE_NAME.to_string(),
             session_pepper,
         })
