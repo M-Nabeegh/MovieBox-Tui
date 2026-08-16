@@ -425,13 +425,14 @@ pub fn adapt_sources(
                 .or_else(|| parse_optional_u64_field(item, "size")),
             language: optional_string(item, "lanName"),
             recommended: false,
+            quality: crate::catalog::QualityTier::Good,
         });
     }
 
-    options.sort_by_key(|option| std::cmp::Reverse(option.height));
-    if let Some(first) = options.first_mut() {
-        first.recommended = true;
-    } else {
+    // Order by real picture quality, not resolution alone, so the recommended
+    // source is the one that actually looks best.
+    crate::catalog::quality::rank(&mut options);
+    if options.is_empty() {
         return Err(CatalogError::QualityUnavailable {
             maximum_height: policy.maximum_height(),
             requested_height: None,

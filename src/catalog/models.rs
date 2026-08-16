@@ -116,6 +116,8 @@ pub struct SourceOption {
     pub size_bytes: Option<u64>,
     pub language: Option<String>,
     pub recommended: bool,
+    /// How this source compares with the others offered for the same title.
+    pub quality: crate::catalog::QualityTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

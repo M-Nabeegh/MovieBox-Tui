@@ -11,7 +11,9 @@ Notifications are off until a webhook is configured.
 ## Setting it up
 
 The payload is a plain `{"title", "body", "url"}` JSON POST, which works with
-[Hark](https://hark.ryan.ceo/) and most other webhook-to-push relays.
+[Hark](https://hark.ryan.ceo/) and most other webhook-to-push relays. The job id
+travels as an `Idempotency-Key` header, so a relay that honours it will not
+deliver the same completion twice.
 
 1. Create a service in your relay and copy its webhook URL.
 2. Save it as a secret — the URL contains a token, so it does not belong in

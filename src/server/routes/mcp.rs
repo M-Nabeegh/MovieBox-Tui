@@ -257,10 +257,10 @@ async fn start_download(state: &AppState, arguments: &Value) -> Result<String, S
             .iter()
             .find(|source| source.id.as_str() == requested)
             .ok_or("that source id is not available for this item")?,
-        None => sources
-            .iter()
-            .filter(|source| source.height <= ceiling)
-            .max_by_key(|source| (source.height, source.recommended))
+        // Ranked on resolution *and* codec-adjusted bitrate, so an agent asking
+        // for "the best" does not land on a starved encode that merely claims a
+        // high resolution.
+        None => crate::catalog::quality::best_within(&sources, ceiling)
             .ok_or_else(|| format!("no source is available at or below {ceiling}p"))?,
     };
     if selected.height > ceiling {

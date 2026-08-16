@@ -679,14 +679,35 @@ pub fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, DownloadErr
     Ok(result)
 }
 
+/// Number of parallel range requests to use for a transfer of `total` bytes.
+///
+/// Sources commonly rate-limit each connection rather than each client, so the
+/// segment count sets the achievable throughput. Small files were previously
+/// capped at two segments, which left them downloading at a quarter of the speed
+/// a larger file got from the same host for no reason other than their size.
+///
+/// `MOVIEBOX_DOWNLOAD_SEGMENTS` overrides the choice for tuning against a
+/// specific host; values are clamped to 1..=MAX_SEGMENTS.
 fn segment_count(total: u64) -> usize {
-    if total < 256 * 1024 * 1024 {
+    if let Some(override_count) = segment_override() {
+        return override_count;
+    }
+    if total < 16 * 1024 * 1024 {
         2
-    } else if total < 2 * 1024 * 1024 * 1024 {
+    } else if total < 256 * 1024 * 1024 {
         4
     } else {
         MAX_SEGMENTS
     }
+}
+
+fn segment_override() -> Option<usize> {
+    std::env::var("MOVIEBOX_DOWNLOAD_SEGMENTS")
+        .ok()?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .map(|value| value.clamp(1, MAX_SEGMENTS))
 }
 
 fn segment_ranges(total: u64, segments: usize) -> Vec<(u64, u64)> {

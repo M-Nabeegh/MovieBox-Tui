@@ -1,5 +1,6 @@
 pub mod models;
 pub mod moviebox;
+pub mod quality;
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ pub use models::{
     MediaType, OpaqueIdCodec, OpaquePayload, QualityPolicy, ResolvedSource, ResolvedSubtitle,
     SearchPage, SeasonInfo, SourceId, SourceOption, SubtitleId, SubtitleTrack,
 };
+pub use quality::QualityTier;
 
 #[async_trait]
 pub trait CatalogProvider: Send + Sync {
