@@ -107,7 +107,9 @@ async fn ready_download_posts_a_greeting_with_a_tap_through_link() {
     );
     let notifier = WebhookNotifier::from_config(&config).unwrap().unwrap();
 
-    notifier.notify_ready("Cocktail 2", Some("2026")).await;
+    notifier
+        .notify_ready("job-1234", "Cocktail 2", Some("2026"))
+        .await;
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -118,6 +120,32 @@ async fn ready_download_posts_a_greeting_with_a_tap_through_link() {
     );
     assert_eq!(body["title"], "MovieBox");
     assert_eq!(body["url"], "https://jellyfin.example.ts.net/");
+
+    // Relays reject unknown fields, so the payload must carry nothing else.
+    let fields = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        fields,
+        ["body", "title", "url"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "payload contains a field the webhook schema does not allow"
+    );
+    assert!(body["body"].as_str().unwrap().len() <= 2000);
+
+    // The job id lets the relay drop a duplicate of the same completion.
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("idempotency-key")
+            .map(|value| value.to_str().unwrap()),
+        Some("job-1234")
+    );
 }
 
 #[tokio::test]
@@ -132,7 +160,9 @@ async fn notification_without_a_recipient_omits_the_greeting() {
     let config = config_with_webhook(&root, &format!("{}/hooks/whk_fixture", server.uri()), None);
     let notifier = WebhookNotifier::from_config(&config).unwrap().unwrap();
 
-    notifier.notify_ready("Cocktail 2", Some("2026")).await;
+    notifier
+        .notify_ready("job-1", "Cocktail 2", Some("2026"))
+        .await;
 
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -156,7 +186,9 @@ async fn a_rejected_notification_does_not_panic_or_propagate() {
     let notifier = WebhookNotifier::from_config(&config).unwrap().unwrap();
 
     // The download already succeeded, so this must be silent and infallible.
-    notifier.notify_ready("Cocktail 2", Some("2026")).await;
+    notifier
+        .notify_ready("job-1", "Cocktail 2", Some("2026"))
+        .await;
 }
 
 #[tokio::test]
@@ -170,7 +202,9 @@ async fn an_unreachable_webhook_does_not_panic_or_propagate() {
     );
     let notifier = WebhookNotifier::from_config(&config).unwrap().unwrap();
 
-    notifier.notify_ready("Cocktail 2", Some("2026")).await;
+    notifier
+        .notify_ready("job-1", "Cocktail 2", Some("2026"))
+        .await;
 }
 
 #[tokio::test]

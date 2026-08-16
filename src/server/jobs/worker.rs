@@ -671,7 +671,7 @@ where
         // down or unconfigured must not turn a finished download into a failure.
         let _ = self.library.refresh().await;
         self.notifier
-            .notify_ready(&ready.title, ready.year.as_deref())
+            .notify_ready(&ready.id.to_string(), &ready.title, ready.year.as_deref())
             .await;
         Ok(WorkerRunOutcome::Progressed)
     }

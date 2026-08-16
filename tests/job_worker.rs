@@ -172,7 +172,7 @@ impl RecordingNotifier {
 
 #[async_trait]
 impl moviebox_tui::server::notify::DownloadNotifier for RecordingNotifier {
-    async fn notify_ready(&self, title: &str, year: Option<&str>) {
+    async fn notify_ready(&self, _job_id: &str, title: &str, year: Option<&str>) {
         self.sent
             .lock()
             .await

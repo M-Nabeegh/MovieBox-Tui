@@ -28,9 +28,12 @@ pub enum NotifyError {
 }
 
 /// Announces that a download is ready to watch.
+///
+/// `job_id` identifies the completion, so a relay that supports idempotency can
+/// discard a duplicate rather than buzzing the phone twice for one film.
 #[async_trait::async_trait]
 pub trait DownloadNotifier: Send + Sync {
-    async fn notify_ready(&self, title: &str, year: Option<&str>);
+    async fn notify_ready(&self, job_id: &str, title: &str, year: Option<&str>);
 }
 
 /// Used when no webhook is configured.
@@ -39,7 +42,7 @@ pub struct NoopNotifier;
 
 #[async_trait::async_trait]
 impl DownloadNotifier for NoopNotifier {
-    async fn notify_ready(&self, _title: &str, _year: Option<&str>) {}
+    async fn notify_ready(&self, _job_id: &str, _title: &str, _year: Option<&str>) {}
 }
 
 /// Posts a completion message to a webhook that turns it into a phone notification.
@@ -114,11 +117,12 @@ fn is_acceptable_webhook(url: &Url) -> bool {
 
 #[async_trait::async_trait]
 impl DownloadNotifier for WebhookNotifier {
-    async fn notify_ready(&self, title: &str, year: Option<&str>) {
+    async fn notify_ready(&self, job_id: &str, title: &str, year: Option<&str>) {
+        // Relays validate this payload strictly, so send only the documented
+        // fields: anything extra is rejected outright.
         let mut payload = json!({
             "title": "MovieBox",
             "body": Self::compose(self.recipient.as_deref(), title, year),
-            "project": "MovieBox",
         });
         if let Some(link) = &self.link {
             payload["url"] = json!(link.as_str());
@@ -130,6 +134,7 @@ impl DownloadNotifier for WebhookNotifier {
         match self
             .http
             .post(self.webhook.clone())
+            .header("Idempotency-Key", job_id)
             .json(&payload)
             .send()
             .await
