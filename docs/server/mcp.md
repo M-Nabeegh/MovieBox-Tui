@@ -20,7 +20,7 @@ openssl rand -base64 32 > deploy/compose/secrets/mcp_token.txt
 Then uncomment this line in `deploy/compose/.env`:
 
 ```
-MOVIEBOX_MCP_TOKEN_FILE=/run/secrets/mcp_token
+MOVIEBOX_MCP_TOKEN_FILE=/optional-secrets/mcp_token.txt
 ```
 
 and recreate the container:

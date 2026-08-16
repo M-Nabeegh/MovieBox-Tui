@@ -37,11 +37,12 @@ services:
       - "${MOVIEBOX_DATA_ROOT}/config/server:/config"
       - "${MOVIEBOX_DATA_ROOT}/partials:/partials"
       - "${MOVIEBOX_DATA_ROOT}/media:/media"
+      # Optional secrets live here rather than in `secrets:` so a file can be
+      # added later to switch a feature on without editing this file.
+      - "./secrets:/optional-secrets:ro"
     secrets:
       - admin_password
       - session_key
-      - jellyfin_api_key
-      - mcp_token
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8420/api/health"]
       interval: 30s
@@ -82,10 +83,3 @@ secrets:
     file: ./secrets/admin_password.txt
   session_key:
     file: ./secrets/session_key.txt
-  # Optional. Create the file to enable the feature; absent means it stays off.
-  jellyfin_api_key:
-    file: ./secrets/jellyfin_api_key.txt
-    required: false
-  mcp_token:
-    file: ./secrets/mcp_token.txt
-    required: false
