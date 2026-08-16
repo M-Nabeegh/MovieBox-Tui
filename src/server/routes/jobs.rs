@@ -29,13 +29,13 @@ pub fn router() -> Router<AppState> {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateRequest {
-    catalog_id: String,
-    source_id: String,
-    subtitle_id: Option<String>,
-    requested_height: u16,
-    season: Option<u16>,
-    episode: Option<u16>,
+pub(crate) struct CreateRequest {
+    pub(crate) catalog_id: String,
+    pub(crate) source_id: String,
+    pub(crate) subtitle_id: Option<String>,
+    pub(crate) requested_height: u16,
+    pub(crate) season: Option<u16>,
+    pub(crate) episode: Option<u16>,
 }
 #[derive(Debug, Deserialize)]
 struct ListQuery {
@@ -132,6 +132,22 @@ async fn create(
     Json(request): Json<CreateRequest>,
 ) -> Result<Response, ApiError> {
     mutation_session(&state, &headers).await?;
+    let job = enqueue_download(&state, request).await?;
+    let mut response = (StatusCode::ACCEPTED, Json(JobDto::from(job))).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    Ok(response)
+}
+
+/// Validate a download request and queue it.
+///
+/// Shared by the browser API and the MCP endpoint so both enforce the same
+/// quality ceiling, source validation, and subtitle handling.
+pub(crate) async fn enqueue_download(
+    state: &AppState,
+    request: CreateRequest,
+) -> Result<crate::server::jobs::DownloadJob, ApiError> {
     if request.requested_height == 0 {
         return Err(ApiError::invalid_request());
     }
@@ -173,7 +189,7 @@ async fn create(
     // a download does not quietly land in the library with no subtitle at all.
     let subtitle_for_resolution = match &request.subtitle_id {
         Some(value) => Some(SubtitleId::new(value.clone())),
-        None => auto_selected_subtitle(&state, &source_id).await,
+        None => auto_selected_subtitle(state, &source_id).await,
     };
     let resolved = state
         .catalog()
@@ -233,11 +249,7 @@ async fn create(
         .await
         .map_err(|_| ApiError::internal())?;
     state.events().publish_job(&job, JobEventKind::Created);
-    let mut response = (StatusCode::ACCEPTED, Json(JobDto::from(job))).into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
-    Ok(response)
+    Ok(job)
 }
 
 async fn pause(

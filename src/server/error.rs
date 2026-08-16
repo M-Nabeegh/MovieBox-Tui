@@ -29,6 +29,11 @@ impl ApiError {
         Self::new(status, code, message)
     }
 
+    /// Stable machine-readable reason, for callers that must branch on it.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
     pub fn not_found() -> Self {
         Self::new(
             StatusCode::NOT_FOUND,

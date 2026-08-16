@@ -5,6 +5,7 @@ pub mod events;
 pub mod health;
 pub mod jobs;
 pub mod library;
+pub mod mcp;
 
 use axum::Router;
 
@@ -22,6 +23,9 @@ pub fn router(state: AppState) -> Router {
     // Task 8 extends this API surface with catalog, jobs, events, and library routes.
     Router::new()
         .nest("/api", api)
+        // Agent access is its own surface with its own bearer-token auth, so it
+        // sits outside the cookie-and-CSRF protected browser API.
+        .merge(mcp::router())
         .merge(assets::router())
         .with_state(state)
 }

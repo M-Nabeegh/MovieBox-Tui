@@ -38,6 +38,8 @@ pub struct ServerConfig {
     pub reserve_gib: u16,
     pub jellyfin_base_url: Url,
     pub jellyfin_api_key_file: Option<PathBuf>,
+    /// Bearer token for the MCP endpoint. Unset leaves the endpoint disabled.
+    pub mcp_token_file: Option<PathBuf>,
     pub log_format: LogFormat,
     /// Language attached automatically when a download names no subtitle.
     pub subtitle_preference: SubtitlePreference,
@@ -90,6 +92,7 @@ impl ServerConfig {
         let jellyfin_base_url =
             parse_jellyfin_base_url(required_var(&env, "MOVIEBOX_JELLYFIN_BASE_URL")?)?;
         let jellyfin_api_key_file = optional_secret_file(&env, "MOVIEBOX_JELLYFIN_API_KEY_FILE")?;
+        let mcp_token_file = optional_secret_file(&env, "MOVIEBOX_MCP_TOKEN_FILE")?;
         let log_format = parse_log_format(required_var(&env, "MOVIEBOX_LOG_FORMAT")?)?;
         // Optional: unset means the default (English); `off` disables it.
         let subtitle_preference = env
@@ -112,11 +115,28 @@ impl ServerConfig {
             reserve_gib,
             jellyfin_base_url,
             jellyfin_api_key_file,
+            mcp_token_file,
             log_format,
             subtitle_preference,
             session_cookie_name: COOKIE_NAME.to_string(),
             session_pepper,
         })
+    }
+
+    /// Read the MCP bearer token, or `None` when the endpoint is disabled.
+    pub fn read_mcp_token(&self) -> Result<Option<String>, ConfigError> {
+        self.mcp_token_file
+            .as_deref()
+            .map(|path| {
+                let token = fs::read_to_string(path)
+                    .map_err(|_| ConfigError::UnreadableSecret("MOVIEBOX_MCP_TOKEN_FILE"))?;
+                let token = token.trim();
+                if token.is_empty() {
+                    return Err(ConfigError::EmptySecret("MOVIEBOX_MCP_TOKEN_FILE"));
+                }
+                Ok(token.to_string())
+            })
+            .transpose()
     }
 
     pub fn read_jellyfin_api_key(&self) -> Result<Option<String>, ConfigError> {

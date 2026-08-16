@@ -28,6 +28,10 @@ services:
       MOVIEBOX_RESERVE_GIB: "${MOVIEBOX_RESERVE_GIB}"
       MOVIEBOX_SUBTITLE_LANGUAGE: "${MOVIEBOX_SUBTITLE_LANGUAGE:-english}"
       MOVIEBOX_JELLYFIN_BASE_URL: http://jellyfin:8096
+      # Point at the secret only when the operator created it; an unset value
+      # leaves the corresponding feature disabled.
+      MOVIEBOX_JELLYFIN_API_KEY_FILE: "${MOVIEBOX_JELLYFIN_API_KEY_FILE:-}"
+      MOVIEBOX_MCP_TOKEN_FILE: "${MOVIEBOX_MCP_TOKEN_FILE:-}"
       MOVIEBOX_LOG_FORMAT: text
     volumes:
       - "${MOVIEBOX_DATA_ROOT}/config/server:/config"
@@ -36,6 +40,8 @@ services:
     secrets:
       - admin_password
       - session_key
+      - jellyfin_api_key
+      - mcp_token
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8420/api/health"]
       interval: 30s
@@ -76,3 +82,10 @@ secrets:
     file: ./secrets/admin_password.txt
   session_key:
     file: ./secrets/session_key.txt
+  # Optional. Create the file to enable the feature; absent means it stays off.
+  jellyfin_api_key:
+    file: ./secrets/jellyfin_api_key.txt
+    required: false
+  mcp_token:
+    file: ./secrets/mcp_token.txt
+    required: false
