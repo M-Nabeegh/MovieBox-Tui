@@ -7,22 +7,56 @@ export function LoginPage({ onAuthenticated }: Props) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
   async function submit(event: FormEvent) {
-    event.preventDefault(); setError(""); setBusy(true);
-    try { await api.request<void>("/auth/login", { method: "POST", body: JSON.stringify({ password }) }); await api.session(); await onAuthenticated(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "Sign in failed."); }
-    finally { setBusy(false); }
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      await api.request<void>("/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ password }),
+      });
+      await api.session();
+      await onAuthenticated();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Sign in failed.");
+    } finally {
+      setBusy(false);
+    }
   }
-  return <main className="login-page"><div className="login-card">
-    <p className="eyebrow">MOVIEBOX / PRIVATE SERVER</p>
-    <h1>Your cinema,<br /><em>on your terms.</em></h1>
-    <p className="lede">Sign in to search the catalog and send titles to your home library.</p>
-    <form onSubmit={submit}>
-      <label htmlFor="password">Server password</label>
-      <input id="password" name="password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
-      {error && <p className="form-error" role="alert">{error}</p>}
-      <button type="submit" disabled={busy}>{busy ? "Checking…" : "Sign in"}<span aria-hidden="true">↗</span></button>
-    </form>
-    <p className="privacy-note">Session stays in a secure browser cookie.<br />Your password never leaves this sign-in request.</p>
-  </div><div className="login-mark" aria-hidden="true"><span>MB</span></div></main>;
+
+  return (
+    <main className="login">
+      <form onSubmit={submit}>
+        <span className="wordmark">
+          NABEEGH<em>BOX</em>
+        </span>
+        <h1>Sign in</h1>
+        <label htmlFor="password" style={{ color: "var(--ink-muted)", fontSize: "var(--step-small)" }}>
+          Server password
+        </label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(event) => setPassword(event.target.value)}
+          required
+        />
+        {error && (
+          <p className="error-note" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="btn btn-primary" type="submit" disabled={busy}>
+          {busy ? "Checking…" : "Sign in"}
+        </button>
+        <p style={{ color: "var(--ink-faint)", fontSize: "var(--step-tiny)", margin: 0 }}>
+          Your session stays in a secure cookie on this device.
+        </p>
+      </form>
+    </main>
+  );
 }

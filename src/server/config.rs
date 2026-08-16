@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub jellyfin_api_key_file: Option<PathBuf>,
     /// Bearer token for the MCP endpoint. Unset leaves the endpoint disabled.
     pub mcp_token_file: Option<PathBuf>,
+    /// TMDB read token, used for artwork and discovery. Unset disables browsing.
+    pub tmdb_token_file: Option<PathBuf>,
     /// Webhook posted when a download is ready. Unset disables notifications.
     pub notify_webhook_url_file: Option<PathBuf>,
     /// Name used to address the notification, e.g. "Hey Nabeegh, ...".
@@ -99,6 +101,7 @@ impl ServerConfig {
             parse_jellyfin_base_url(required_var(&env, "MOVIEBOX_JELLYFIN_BASE_URL")?)?;
         let jellyfin_api_key_file = optional_secret_file(&env, "MOVIEBOX_JELLYFIN_API_KEY_FILE")?;
         let mcp_token_file = optional_secret_file(&env, "MOVIEBOX_MCP_TOKEN_FILE")?;
+        let tmdb_token_file = optional_secret_file(&env, "MOVIEBOX_TMDB_TOKEN_FILE")?;
         let notify_webhook_url_file =
             optional_secret_file(&env, "MOVIEBOX_NOTIFY_WEBHOOK_URL_FILE")?;
         let notify_recipient = env
@@ -137,6 +140,7 @@ impl ServerConfig {
             jellyfin_base_url,
             jellyfin_api_key_file,
             mcp_token_file,
+            tmdb_token_file,
             notify_webhook_url_file,
             notify_recipient,
             notify_link_url,
@@ -145,6 +149,22 @@ impl ServerConfig {
             session_cookie_name: COOKIE_NAME.to_string(),
             session_pepper,
         })
+    }
+
+    /// Read the TMDB token, or `None` when discovery is disabled.
+    pub fn read_tmdb_token(&self) -> Result<Option<String>, ConfigError> {
+        self.tmdb_token_file
+            .as_deref()
+            .map(|path| {
+                let token = fs::read_to_string(path)
+                    .map_err(|_| ConfigError::UnreadableSecret("MOVIEBOX_TMDB_TOKEN_FILE"))?;
+                let token = token.trim();
+                if token.is_empty() {
+                    return Err(ConfigError::EmptySecret("MOVIEBOX_TMDB_TOKEN_FILE"));
+                }
+                Ok(token.to_string())
+            })
+            .transpose()
     }
 
     /// Read the completion webhook URL, or `None` when notifications are off.

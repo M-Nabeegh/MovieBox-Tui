@@ -1,12 +1,24 @@
-import type { ApiRequestInit, ErrorEnvelope, Job, Session } from "./types";
+import type {
+  ApiRequestInit,
+  CreateJobRequest,
+  DiscoverRow,
+  DiscoverTitle,
+  ErrorEnvelope,
+  Job,
+  SearchPage,
+  Session,
+  SourceOption,
+} from "./types";
 
 let csrfToken = "";
 let onUnauthorized: (() => void) | undefined;
 
-export function setUnauthorizedHandler(handler: () => void) { onUnauthorized = handler; }
+export function setUnauthorizedHandler(handler: () => void) {
+  onUnauthorized = handler;
+}
 
 async function readError(response: Response): Promise<Error> {
-  const body = await response.json().catch(() => null) as ErrorEnvelope | null;
+  const body = (await response.json().catch(() => null)) as ErrorEnvelope | null;
   return new Error(body?.error?.message ?? `Request failed (${response.status})`);
 }
 
@@ -18,18 +30,42 @@ export const api = {
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     if (method !== "GET" && method !== "HEAD" && csrfToken) headers.set("X-CSRF-Token", csrfToken);
     const response = await fetch(`/api${path}`, { ...init, headers, credentials: "same-origin" });
-    if (response.status === 401 && init.retryOnAuth !== false) { onUnauthorized?.(); }
+    if (response.status === 401 && init.retryOnAuth !== false) onUnauthorized?.();
     if (!response.ok) throw await readError(response);
     if (response.status === 204) return undefined as T;
-    return await response.json() as T;
+    return (await response.json()) as T;
   },
+
   async session(): Promise<Session> {
     const session = await this.request<Session>("/auth/session", { retryOnAuth: false });
     csrfToken = session.csrf_token;
     return session;
   },
+
+  discover: {
+    rows: () => api.request<DiscoverRow[]>("/discover"),
+    search: (query: string) =>
+      api.request<DiscoverTitle[]>(`/discover/search?q=${encodeURIComponent(query)}`),
+  },
+
+  catalog: {
+    search: (query: string) =>
+      api.request<SearchPage>(`/catalog/search?q=${encodeURIComponent(query)}`),
+    sources: (catalogId: string) =>
+      api.request<SourceOption[]>(
+        `/catalog/items/moviebox/${encodeURIComponent(catalogId)}/sources`,
+      ),
+  },
+
+  createJob: (body: CreateJobRequest) =>
+    api.request<Job>("/jobs", { method: "POST", body: JSON.stringify(body) }),
+
   jobs: {
     list: () => api.request<Job[]>("/jobs"),
-    action: (id: string, action: "pause" | "resume" | "cancel" | "retry", version: number) => api.request<Job>(`/jobs/${encodeURIComponent(id)}/${action}`, { method: "POST", body: JSON.stringify({ version }) }),
+    action: (id: string, action: "pause" | "resume" | "cancel" | "retry", version: number) =>
+      api.request<Job>(`/jobs/${encodeURIComponent(id)}/${action}`, {
+        method: "POST",
+        body: JSON.stringify({ version }),
+      }),
   },
 };

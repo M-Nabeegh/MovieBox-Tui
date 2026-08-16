@@ -1,6 +1,7 @@
 pub mod models;
 pub mod moviebox;
 pub mod quality;
+pub mod tmdb;
 
 use async_trait::async_trait;
 use std::sync::Arc;

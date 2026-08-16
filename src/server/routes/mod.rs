@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod auth;
 pub mod catalog;
+pub mod discover;
 pub mod events;
 pub mod health;
 pub mod jobs;
@@ -16,6 +17,7 @@ pub fn router(state: AppState) -> Router {
         .merge(health::router())
         .merge(auth::router())
         .merge(catalog::router())
+        .merge(discover::router())
         .merge(jobs::router())
         .merge(library::router())
         .merge(events::router());

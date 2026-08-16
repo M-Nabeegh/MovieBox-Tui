@@ -1,1 +1,73 @@
-:root { color-scheme: dark; --ink: #f3eee4; --muted: #a39e98; --night: #0b0d12; --panel: #12161f; --line: #2b3039; --ember: #e7593e; --blue: #182231; --space-1: 8px; --space-2: 12px; --space-3: 16px; --space-4: 24px; --space-5: 32px; }
+/* Design tokens for NabeeghBox.
+ *
+ * A streaming interface lives or dies on how the artwork reads, so the palette
+ * stays near-black and almost colourless: posters supply the colour, the chrome
+ * gets out of their way. The one saturated accent is reserved for the wordmark
+ * and primary actions, where it has to carry meaning. */
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces — deliberately close together so cards separate by elevation and
+     artwork rather than by hard borders. */
+  --bg: #0b0b0b;
+  --bg-raised: #141414;
+  --bg-card: #1c1c1e;
+  --bg-hover: #232326;
+  --scrim: rgba(0, 0, 0, 0.72);
+
+  /* Type */
+  --ink: #ffffff;
+  --ink-soft: #d2d2d7;
+  --ink-muted: #8c8c94;
+  --ink-faint: #6a6a72;
+
+  /* The signature red. Used sparingly: wordmark, primary button, live state. */
+  --accent: #e50914;
+  --accent-hot: #f6121d;
+  --accent-deep: #b0060f;
+
+  --positive: #46d369;
+  --warning: #e8b339;
+  --danger: #f2544b;
+
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.18);
+
+  /* Netflix Sans is proprietary; this stack lands on SF Pro / Segoe / Roboto,
+     which share its humanist-grotesque proportions. Tight tracking at large
+     sizes is what actually reads as "streaming service". */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Inter, Arial, sans-serif;
+
+  --step-hero: clamp(2.5rem, 6vw, 4.5rem);
+  --step-title: clamp(1.35rem, 2.4vw, 2rem);
+  --step-row: clamp(1.05rem, 1.5vw, 1.35rem);
+  --step-body: 0.95rem;
+  --step-small: 0.8rem;
+  --step-tiny: 0.7rem;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 72px;
+
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+
+  --shadow-card: 0 12px 32px rgba(0, 0, 0, 0.7);
+  --shadow-modal: 0 32px 80px rgba(0, 0, 0, 0.85);
+
+  /* Slightly overshooting ease — the small "settle" is what makes a card feel
+     physical rather than merely resized. */
+  --ease-out: cubic-bezier(0.2, 0.9, 0.3, 1);
+  --speed: 220ms;
+
+  --gutter: clamp(16px, 3.8vw, 60px);
+  --row-gap: clamp(8px, 0.7vw, 12px);
+}
