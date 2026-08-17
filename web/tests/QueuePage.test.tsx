@@ -110,3 +110,70 @@ test("an unavailable queue reports itself instead of rendering empty", async () 
   expect(await screen.findByRole("alert")).toHaveTextContent(/unavailable/i);
   fetchMock.mockRestore();
 });
+
+const readyJob = {
+  id: "ready-1",
+  title: "Tumbbad",
+  year: "2018",
+  media_type: "movie",
+  state: "ready",
+  requested_height: 1080,
+  downloaded_bytes: 100,
+  total_bytes: 100,
+  speed_bytes_per_second: null,
+  attempt: 1,
+  error_code: null,
+  error_message: null,
+  warning: null,
+  version: 5,
+};
+
+test("a finished download offers a play link to the media server", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.includes("/library/")) {
+      return json({
+        status: "ready",
+        url: "https://media.example.ts.net:8443/web/index.html#!/details?id=abc",
+      });
+    }
+    return json([readyJob]);
+  });
+
+  render(<QueuePage />);
+  const play = await screen.findByRole("link", { name: /play in nabeeghfin/i });
+  // The link must point at an address a browser can actually reach, never the
+  // container-internal one the server uses for its own API calls.
+  expect(play).toHaveAttribute(
+    "href",
+    "https://media.example.ts.net:8443/web/index.html#!/details?id=abc",
+  );
+  expect(play).toHaveAttribute("target", "_blank");
+  fetchMock.mockRestore();
+});
+
+test("a title the media server has not indexed says so instead of linking", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.includes("/library/")) return json({ status: "scan_pending", url: null });
+    return json([readyJob]);
+  });
+
+  render(<QueuePage />);
+  expect(await screen.findByText(/waiting for nabeeghfin to index it/i)).toBeVisible();
+  expect(screen.queryByRole("link", { name: /play/i })).toBeNull();
+  fetchMock.mockRestore();
+});
+
+test("a failing library lookup does not break the finished card", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.includes("/library/")) return new Response(null, { status: 500 });
+    return json([readyJob]);
+  });
+
+  render(<QueuePage />);
+  expect(await screen.findByText("Tumbbad")).toBeVisible();
+  expect(await screen.findByText(/not indexed by nabeeghfin yet/i)).toBeVisible();
+  fetchMock.mockRestore();
+});

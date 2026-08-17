@@ -34,3 +34,9 @@ export type DiscoverTitle = {
 
 /** A named strip of titles in the browse view. */
 export type DiscoverRow = { id: string; title: string; items: DiscoverTitle[] };
+
+/** Whether a finished download has been indexed by the media server yet. */
+export type LibraryStatus = {
+  status: "ready" | "scan_pending" | "unavailable" | string;
+  url: string | null;
+};

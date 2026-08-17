@@ -30,6 +30,9 @@ pub struct JellyfinLibraryStatus {
 pub struct JellyfinClient {
     http: Client,
     base_url: Url,
+    /// Where a browser should be sent. Falls back to `base_url` when unset,
+    /// which is only correct when the two are the same address.
+    public_url: Option<Url>,
     api_key: Option<HeaderValue>,
     poll_interval: Duration,
     max_attempts: usize,
@@ -40,7 +43,14 @@ impl JellyfinClient {
         let api_key = config
             .read_jellyfin_api_key()
             .map_err(|_| JellyfinError::SecretUnavailable)?;
-        Self::new(config.jellyfin_base_url.clone(), api_key)
+        Ok(Self::new(config.jellyfin_base_url.clone(), api_key)?
+            .with_public_url(config.jellyfin_public_url.clone()))
+    }
+
+    /// Set the address used for links handed to a browser.
+    pub fn with_public_url(mut self, public_url: Option<Url>) -> Self {
+        self.public_url = public_url;
+        self
     }
 
     pub fn new(base_url: Url, api_key: Option<String>) -> Result<Self, JellyfinError> {
@@ -66,6 +76,7 @@ impl JellyfinClient {
                 .build()
                 .expect("fixed Jellyfin HTTP client options are valid"),
             base_url,
+            public_url: None,
             api_key,
             poll_interval,
             max_attempts: max_attempts.max(1),
@@ -136,8 +147,16 @@ impl JellyfinClient {
         Ok(None)
     }
 
+    /// A link a browser can follow to this item.
+    ///
+    /// Built from the public address, never the internal one: the API talks to
+    /// a container hostname that resolves only inside this network, so a link
+    /// built from it is dead the moment it reaches the user.
     pub fn deep_link(&self, item_id: &str) -> Result<Url, JellyfinError> {
-        let mut url = self.endpoint("web/index.html")?;
+        let base = self.public_url.as_ref().unwrap_or(&self.base_url);
+        let mut url = base
+            .join("web/index.html")
+            .map_err(|_| JellyfinError::InvalidBaseUrl)?;
         url.set_fragment(Some(&format!("!/details?id={item_id}")));
         Ok(url)
     }

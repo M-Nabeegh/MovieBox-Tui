@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api } from "../../api/client";
 import type { Job, JobState } from "../../api/types";
+import { ReadyCard } from "./ReadyCard";
 
 const LABELS: Record<JobState, string> = {
   queued: "Queued",
@@ -29,6 +30,10 @@ function remaining(job: Job) {
 export function JobCard({ job, onChanged }: { job: Job; onChanged: () => void }) {
   const [working, setWorking] = useState(false);
   const [confirming, setConfirming] = useState(false);
+
+  // A finished download is a different thing from one in progress: it has no
+  // controls, only somewhere to go and watch it.
+  if (job.state === "ready") return <ReadyCard job={job} />;
 
   const action =
     job.state === "downloading"

@@ -37,6 +37,11 @@ pub struct ServerConfig {
     pub reserve_bytes: u64,
     pub reserve_gib: u16,
     pub jellyfin_base_url: Url,
+    /// Address a browser can reach Jellyfin on.
+    ///
+    /// `jellyfin_base_url` is a container-internal name that only this server
+    /// can resolve, so a link built from it is dead in the user's browser.
+    pub jellyfin_public_url: Option<Url>,
     pub jellyfin_api_key_file: Option<PathBuf>,
     /// Bearer token for the MCP endpoint. Unset leaves the endpoint disabled.
     pub mcp_token_file: Option<PathBuf>,
@@ -102,6 +107,16 @@ impl ServerConfig {
         let reserve_gib = parse_reserve_gib(required_var(&env, "MOVIEBOX_RESERVE_GIB")?)?;
         let jellyfin_base_url =
             parse_jellyfin_base_url(required_var(&env, "MOVIEBOX_JELLYFIN_BASE_URL")?)?;
+        let jellyfin_public_url = env
+            .get("MOVIEBOX_JELLYFIN_PUBLIC_URL")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                Url::parse(value)
+                    .map_err(|_| ConfigError::InvalidUrl("MOVIEBOX_JELLYFIN_PUBLIC_URL"))
+            })
+            .transpose()?;
         let jellyfin_api_key_file = optional_secret_file(&env, "MOVIEBOX_JELLYFIN_API_KEY_FILE")?;
         let mcp_token_file = optional_secret_file(&env, "MOVIEBOX_MCP_TOKEN_FILE")?;
         let tmdb_token_file = optional_secret_file(&env, "MOVIEBOX_TMDB_TOKEN_FILE")?;
@@ -146,6 +161,7 @@ impl ServerConfig {
             reserve_bytes: reserve_gib as u64 * 1024 * 1024 * 1024,
             reserve_gib,
             jellyfin_base_url,
+            jellyfin_public_url,
             jellyfin_api_key_file,
             mcp_token_file,
             tmdb_token_file,

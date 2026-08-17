@@ -6,6 +6,7 @@ import type {
   DiscoverTitle,
   ErrorEnvelope,
   Job,
+  LibraryStatus,
   SearchPage,
   Session,
   SourceOption,
@@ -61,6 +62,11 @@ export const api = {
     },
     details: (catalogId: string) =>
       api.request<CatalogDetails>(`/catalog/items/moviebox/${encodeURIComponent(catalogId)}`),
+  },
+
+  library: {
+    forJob: (jobId: string) =>
+      api.request<LibraryStatus>(`/library/${encodeURIComponent(jobId)}`),
   },
 
   createJob: (body: CreateJobRequest) =>
