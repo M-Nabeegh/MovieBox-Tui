@@ -223,13 +223,26 @@ impl AuthService {
         let origin = origin.ok_or_else(ApiError::invalid_origin)?;
         let host = host.ok_or_else(ApiError::invalid_origin)?;
         let parsed_origin = Url::parse(origin).map_err(|_| ApiError::invalid_origin())?;
-        if parsed_origin.scheme() != "https" {
-            return Err(ApiError::invalid_origin());
-        }
 
         let expected = parse_host_header(host).ok_or_else(ApiError::invalid_origin)?;
         let actual_host = parsed_origin.host().ok_or_else(ApiError::invalid_origin)?;
         let expected_host = expected.host().ok_or_else(ApiError::invalid_origin)?;
+
+        // HTTPS is required everywhere except loopback. Reaching the server
+        // through a local port-forward or an SSH tunnel is plain HTTP by
+        // nature, and the traffic never leaves the machine, so demanding TLS
+        // there blocks legitimate local access without protecting anything.
+        // Browsers agree: they already treat localhost as a secure context.
+        //
+        // This does not weaken the cross-site check below, which is what
+        // actually defends against forged requests: the origin's host and port
+        // must still match the request's.
+        if parsed_origin.scheme() != "https"
+            && !(is_loopback(&actual_host) && is_loopback(&expected_host))
+        {
+            return Err(ApiError::invalid_origin());
+        }
+
         if !hosts_match(actual_host, expected_host)
             || effective_port(&parsed_origin) != effective_port(&expected)
         {
@@ -390,6 +403,18 @@ fn parse_host_header(host: &str) -> Option<Url> {
     Some(parsed)
 }
 
+/// Whether a host refers to this machine.
+///
+/// Only these names can be reached without crossing a network, which is what
+/// makes plain HTTP acceptable for them.
+fn is_loopback(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    }
+}
+
 fn hosts_match(actual: Host<&str>, expected: Host<&str>) -> bool {
     match (actual, expected) {
         (Host::Domain(actual), Host::Domain(expected)) => actual.eq_ignore_ascii_case(expected),
@@ -415,4 +440,87 @@ fn prune_failures(entry: &mut VecDeque<OffsetDateTime>, now: OffsetDateTime) {
             break;
         }
     }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use crate::server::config::ServerConfig;
+
+    /// A service built without touching the filesystem or a database.
+    fn service() -> AuthService {
+        AuthService {
+            session_cookie_name: "moviebox_session".to_string(),
+            session_pepper: [0_u8; 32],
+            login_failures: Default::default(),
+        }
+    }
+
+    fn check(origin: &str, host: &str) -> bool {
+        service().validate_origin(Some(origin), Some(host)).is_ok()
+    }
+
+    #[test]
+    fn https_origins_matching_the_host_are_accepted() {
+        assert!(check(
+            "https://media.example.ts.net",
+            "media.example.ts.net"
+        ));
+        assert!(check(
+            "https://media.example.ts.net:8443",
+            "media.example.ts.net:8443"
+        ));
+    }
+
+    #[test]
+    fn plain_http_is_accepted_only_over_loopback() {
+        // Reached through a local port-forward, the traffic never leaves the
+        // machine, and browsers already treat localhost as a secure context.
+        assert!(check("http://localhost:8420", "localhost:8420"));
+        assert!(check("http://127.0.0.1:8420", "127.0.0.1:8420"));
+        assert!(check("http://[::1]:8420", "[::1]:8420"));
+    }
+
+    #[test]
+    fn plain_http_is_still_refused_for_anything_reachable_over_a_network() {
+        assert!(!check(
+            "http://media.example.ts.net",
+            "media.example.ts.net"
+        ));
+        assert!(!check("http://192.168.68.95:8420", "192.168.68.95:8420"));
+        assert!(!check("http://10.0.0.5:8420", "10.0.0.5:8420"));
+    }
+
+    #[test]
+    fn a_mismatched_origin_is_refused_even_on_loopback() {
+        // The loopback exception relaxes the transport requirement only. The
+        // cross-site check is what stops forged requests and still applies.
+        assert!(!check("http://evil.example", "localhost:8420"));
+        assert!(!check("http://localhost:8420", "media.example.ts.net"));
+        assert!(!check("http://localhost:9999", "localhost:8420"));
+        assert!(!check("https://evil.example", "localhost:8420"));
+    }
+
+    #[test]
+    fn a_missing_origin_or_host_is_refused() {
+        assert!(
+            service()
+                .validate_origin(None, Some("localhost:8420"))
+                .is_err()
+        );
+        assert!(
+            service()
+                .validate_origin(Some("http://localhost:8420"), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_malformed_origin_is_refused() {
+        assert!(!check("not a url", "localhost:8420"));
+        assert!(!check("file:///etc/passwd", "localhost:8420"));
+    }
+
+    #[allow(dead_code)]
+    fn _config_type_is_referenced(_: &ServerConfig) {}
 }
