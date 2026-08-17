@@ -220,6 +220,36 @@ pub(crate) async fn enqueue_download(
     let paths = namer
         .paths_for(&identity, "mkv", subtitle_naming, id)
         .map_err(|_| ApiError::internal())?;
+
+    // The worker only notices a duplicate once it claims the job, so without
+    // this several copies of the same title can sit in the queue at once,
+    // each one discovering the collision separately.
+    let final_video_path = paths.video_relative.to_string_lossy().to_string();
+    let already_queued = state
+        .jobs()
+        .list_all()
+        .await
+        .map_err(|_| ApiError::internal())?
+        .into_iter()
+        .any(|job| {
+            job.final_video_path == final_video_path
+                && matches!(
+                    job.state,
+                    JobState::Queued
+                        | JobState::Resolving
+                        | JobState::Downloading
+                        | JobState::Paused
+                        | JobState::Finalizing
+                        | JobState::Ready
+                )
+        });
+    if already_queued {
+        return Err(ApiError::new_status(
+            StatusCode::CONFLICT,
+            "already_queued",
+            "That title is already downloading or in your library.",
+        ));
+    }
     let job = state
         .jobs()
         .create_with_id(
@@ -238,7 +268,7 @@ pub(crate) async fn enqueue_download(
                     _ => None,
                 },
                 requested_height: request.requested_height,
-                final_video_path: paths.video_relative.to_string_lossy().into(),
+                final_video_path: final_video_path.clone(),
                 final_subtitle_path: paths.subtitle_relative.map(|p| p.to_string_lossy().into()),
                 partial_video_path: paths.partial_video_relative.to_string_lossy().into(),
                 partial_subtitle_path: paths

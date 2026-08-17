@@ -25,6 +25,7 @@ const rows = [
         backdrop_url: "https://image.tmdb.org/t/p/w1280/b.jpg",
         rating: 8.2,
         language: "hi",
+        media_kind: "movie",
       },
     ],
   },

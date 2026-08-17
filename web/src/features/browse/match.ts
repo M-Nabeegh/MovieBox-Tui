@@ -10,8 +10,33 @@ import type { CatalogItem, DiscoverTitle } from "../../api/types";
  * the nearest thing to hand.
  */
 
+import type { Job } from "../../api/types";
+
 /** Release dates differ between catalogues by up to a year for the same film. */
 const YEAR_TOLERANCE = 1;
+
+/** How a browsed title relates to what is already on the server. */
+export type LibraryState = "ready" | "downloading" | null;
+
+/**
+ * Whether a browsed title is already downloaded or on its way.
+ *
+ * Queueing something twice wastes bandwidth and only fails once the worker gets
+ * to it, so browse marks what is already accounted for.
+ */
+export function libraryStateFor(title: DiscoverTitle, jobs: Job[]): LibraryState {
+  const wanted = normalizeTitle(title.title);
+  const matching = jobs.filter((job) => normalizeTitle(job.title) === wanted);
+  if (matching.some((job) => job.state === "ready")) return "ready";
+  if (
+    matching.some((job) =>
+      ["queued", "resolving", "downloading", "paused", "finalizing"].includes(job.state),
+    )
+  ) {
+    return "downloading";
+  }
+  return null;
+}
 
 /**
  * Reduce a title to its comparable core.
@@ -52,13 +77,21 @@ export function findMatch(
   const wanted = normalizeTitle(title.title);
   if (!wanted) return null;
 
+  // A show and a film can share a name — a series must not satisfy a request
+  // for the film, or vice versa.
+  const wantedType = title.media_kind === "series" ? "series" : "movie";
   const sameTitle = candidates.filter(
-    (item) => item.media_type === "movie" && normalizeTitle(item.title) === wanted,
+    (item) => item.media_type === wantedType && normalizeTitle(item.title) === wanted,
   );
   if (sameTitle.length === 0) return null;
 
   // With the title settled, the year decides between re-releases and remakes.
-  const sameYear = sameTitle.filter((item) => yearsAgree(title.year, item.year));
+  // A long-running show's listed year drifts between catalogues, so the year is
+  // only decisive for films.
+  const sameYear =
+    wantedType === "series"
+      ? sameTitle
+      : sameTitle.filter((item) => yearsAgree(title.year, item.year));
   if (sameYear.length === 0) return null;
 
   // Prefer an exact year over one merely within tolerance.

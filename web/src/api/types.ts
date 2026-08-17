@@ -18,6 +18,8 @@ export type JobUpdatedEvent = Pick<Job, "id" | "state" | "downloaded_bytes" | "t
 export type QualityTier = "best" | "good" | "lower";
 
 /** A title as the metadata catalogue describes it, with artwork for browsing. */
+export type MediaKind = "movie" | "series";
+
 export type DiscoverTitle = {
   tmdb_id: number;
   title: string;
@@ -27,6 +29,7 @@ export type DiscoverTitle = {
   backdrop_url: string | null;
   rating: number | null;
   language: string | null;
+  media_kind: MediaKind;
 };
 
 /** A named strip of titles in the browse view. */

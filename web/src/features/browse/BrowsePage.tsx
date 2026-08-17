@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../../api/client";
-import type { DiscoverRow, DiscoverTitle } from "../../api/types";
+import type { DiscoverRow, DiscoverTitle, Job } from "../../api/types";
 import { Hero } from "./Hero";
+import { libraryStateFor } from "./match";
 import { Row, RowSkeleton } from "./Row";
 
 export function BrowsePage({
@@ -15,6 +16,7 @@ export function BrowsePage({
 }) {
   const [rows, setRows] = useState<DiscoverRow[] | null>(null);
   const [results, setResults] = useState<DiscoverTitle[] | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -22,7 +24,15 @@ export function BrowsePage({
       .rows()
       .then(setRows)
       .catch((cause: Error) => setError(cause.message));
+    // Browse marks what is already downloaded or on its way; a failure here
+    // costs only the badges, so it must not block the page.
+    api.jobs.list().then(setJobs).catch(() => setJobs([]));
   }, []);
+
+  const libraryFor = useCallback(
+    (title: DiscoverTitle) => libraryStateFor(title, jobs),
+    [jobs],
+  );
 
   // Searching replaces the rows; clearing the box restores them.
   useEffect(() => {
@@ -57,6 +67,7 @@ export function BrowsePage({
       <div className="rows" style={{ marginTop: 96 }}>
         <Row
           row={{ id: "results", title: `Results for “${query.trim()}”`, items: results }}
+          libraryFor={libraryFor}
           onSelect={onSelect}
         />
         {results.length === 0 && <p className="empty">Nothing matched that search.</p>}
@@ -83,7 +94,7 @@ export function BrowsePage({
       <Hero title={featured} name={name} onSelect={onSelect} />
       <div className="rows">
         {rows.map((row) => (
-          <Row key={row.id} row={row} onSelect={onSelect} />
+          <Row key={row.id} row={row} libraryFor={libraryFor} onSelect={onSelect} />
         ))}
       </div>
     </>

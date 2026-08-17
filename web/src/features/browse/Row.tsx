@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { DiscoverRow, DiscoverTitle } from "../../api/types";
+import type { LibraryState } from "./match";
 import { PosterCard } from "./PosterCard";
 
 /** How much of the visible width one arrow press moves, as a fraction. */
@@ -7,9 +8,11 @@ const PAGE_FRACTION = 0.9;
 
 export function Row({
   row,
+  libraryFor,
   onSelect,
 }: {
   row: DiscoverRow;
+  libraryFor?: (title: DiscoverTitle) => LibraryState;
   onSelect: (title: DiscoverTitle) => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
@@ -68,7 +71,12 @@ export function Row({
 
         <div className="row-scroller" ref={scroller} onScroll={measure}>
           {row.items.map((title) => (
-            <PosterCard key={title.tmdb_id} title={title} onSelect={onSelect} />
+            <PosterCard
+              key={title.tmdb_id}
+              title={title}
+              library={libraryFor?.(title)}
+              onSelect={onSelect}
+            />
           ))}
         </div>
 

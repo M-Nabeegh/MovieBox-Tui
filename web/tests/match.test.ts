@@ -1,7 +1,11 @@
-import { findMatch, normalizeTitle } from "../src/features/browse/match";
+import { findMatch, libraryStateFor, normalizeTitle } from "../src/features/browse/match";
 import type { CatalogItem, DiscoverTitle } from "../src/api/types";
 
-function browsed(title: string, year: string | null): DiscoverTitle {
+function browsed(
+  title: string,
+  year: string | null,
+  media_kind: DiscoverTitle["media_kind"] = "movie",
+): DiscoverTitle {
   return {
     tmdb_id: 1,
     title,
@@ -11,6 +15,7 @@ function browsed(title: string, year: string | null): DiscoverTitle {
     backdrop_url: null,
     rating: null,
     language: null,
+    media_kind,
   };
 }
 
@@ -81,6 +86,39 @@ test("a series entry is not offered for a browsed movie", () => {
   expect(findMatch(wanted, [series])).toBeNull();
 });
 
+test("a browsed show matches the series entry, not a same-named film", () => {
+  const wanted = browsed("Paatal Lok", "2020", "series");
+  const film: CatalogItem = {
+    id: "film",
+    title: "Paatal Lok",
+    year: "2020",
+    media_type: "movie",
+    season_count: null,
+  };
+  const show: CatalogItem = {
+    id: "show",
+    title: "Paatal Lok",
+    year: "2020",
+    media_type: "series",
+    season_count: 2,
+  };
+  expect(findMatch(wanted, [film, show])?.id).toBe("show");
+});
+
+test("a long-running show still matches when the listed year drifts", () => {
+  // Catalogues disagree about a show's year — first air date, latest season, or
+  // the entry's own year — so the year cannot be decisive for series.
+  const wanted = browsed("Panchayat", "2020", "series");
+  const show: CatalogItem = {
+    id: "show",
+    title: "Panchayat",
+    year: "2024",
+    media_type: "series",
+    season_count: 3,
+  };
+  expect(findMatch(wanted, [show])?.id).toBe("show");
+});
+
 test("a missing year on either side does not block a title match", () => {
   expect(findMatch(browsed("Tumbbad", null), [candidate("Tumbbad", "2018")])).not.toBeNull();
   expect(findMatch(browsed("Tumbbad", "2018"), [candidate("Tumbbad", null)])).not.toBeNull();
@@ -90,4 +128,40 @@ test("normalization strips accents and collapses separators", () => {
   expect(normalizeTitle("Amélie")).toBe("amelie");
   expect(normalizeTitle("Spider-Man:  Brand New Day")).toBe("spider man brand new day");
   expect(normalizeTitle("The Godfather")).toBe("godfather");
+});
+
+function job(title: string, state: string) {
+  return { title, state } as unknown as import("../src/api/types").Job;
+}
+
+test("a downloaded title is marked as being in the library", () => {
+  const state = libraryStateFor(browsed("Tumbbad", "2018"), [job("Tumbbad", "ready")]);
+  expect(state).toBe("ready");
+});
+
+test("an in-flight title is marked as downloading", () => {
+  for (const inFlight of ["queued", "resolving", "downloading", "paused", "finalizing"]) {
+    expect(libraryStateFor(browsed("Tumbbad", "2018"), [job("Tumbbad", inFlight)])).toBe(
+      "downloading",
+    );
+  }
+});
+
+test("a failed or cancelled attempt leaves the title unmarked", () => {
+  // Those can be retried, so the title is not accounted for.
+  for (const done of ["failed", "cancelled"]) {
+    expect(libraryStateFor(browsed("Tumbbad", "2018"), [job("Tumbbad", done)])).toBeNull();
+  }
+});
+
+test("a ready copy outranks an in-flight one for the same title", () => {
+  const state = libraryStateFor(browsed("Tumbbad", "2018"), [
+    job("Tumbbad", "downloading"),
+    job("Tumbbad", "ready"),
+  ]);
+  expect(state).toBe("ready");
+});
+
+test("an unrelated title is not marked", () => {
+  expect(libraryStateFor(browsed("Tumbbad", "2018"), [job("Nosferatu", "ready")])).toBeNull();
 });

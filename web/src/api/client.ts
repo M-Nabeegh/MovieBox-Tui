@@ -52,10 +52,13 @@ export const api = {
   catalog: {
     search: (query: string) =>
       api.request<SearchPage>(`/catalog/search?q=${encodeURIComponent(query)}`),
-    sources: (catalogId: string) =>
-      api.request<SourceOption[]>(
-        `/catalog/items/moviebox/${encodeURIComponent(catalogId)}/sources`,
-      ),
+    /** Sources for a film, or for one episode when season and episode are given. */
+    sources: (catalogId: string, episode?: { season: number; episode: number }) => {
+      const query = episode ? `?season=${episode.season}&episode=${episode.episode}` : "";
+      return api.request<SourceOption[]>(
+        `/catalog/items/moviebox/${encodeURIComponent(catalogId)}/sources${query}`,
+      );
+    },
     details: (catalogId: string) =>
       api.request<CatalogDetails>(`/catalog/items/moviebox/${encodeURIComponent(catalogId)}`),
   },

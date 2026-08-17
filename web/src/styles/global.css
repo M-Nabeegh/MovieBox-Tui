@@ -773,3 +773,84 @@ img {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+
+/* ---------------------------------------------------------------- seasons */
+
+.seasons {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  margin-top: var(--space-5);
+}
+
+.episode-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.episode {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  text-align: left;
+  transition: border-color var(--speed) var(--ease-out), background var(--speed) var(--ease-out);
+}
+
+.episode:hover {
+  border-color: var(--line-strong);
+  background: var(--bg-hover);
+}
+
+/* The chosen episode has to stay obvious once the source list appears below,
+   which is far enough down to lose track of what was selected. */
+.episode[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: rgba(229, 9, 20, 0.12);
+}
+
+.episode-number {
+  font-weight: 700;
+  font-size: var(--step-small);
+}
+
+.episode-title {
+  color: var(--ink-muted);
+  font-size: var(--step-tiny);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ owned */
+
+/* Sits on the artwork so it registers while scanning a row, before the title
+   below has even been read. */
+.owned {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 2;
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  font-size: var(--step-tiny);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  backdrop-filter: blur(4px);
+}
+
+.owned-ready {
+  background: rgba(70, 211, 105, 0.9);
+  color: #06210f;
+}
+
+.owned-downloading {
+  background: rgba(229, 9, 20, 0.92);
+  color: var(--ink);
+}

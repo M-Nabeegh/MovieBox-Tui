@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../../api/client";
 import type { CatalogDetails, DiscoverTitle, SourceOption } from "../../api/types";
 import { findMatch } from "./match";
@@ -9,8 +9,9 @@ type Match = {
   matchedYear: string | null;
   /** What the download catalogue itself says about the matched entry. */
   details: CatalogDetails | null;
-  sources: SourceOption[];
 };
+
+type Episode = { season: number; episode: number };
 
 /** Human-readable file size. */
 function formatSize(bytes: number | null) {
@@ -33,7 +34,7 @@ const QUALITY_COPY: Record<SourceOption["quality"], string> = {
  * search result would silently download a different film — a franchise sibling
  * is not a near-miss, it is the wrong movie.
  */
-async function findSources(title: DiscoverTitle): Promise<Match> {
+async function findEntry(title: DiscoverTitle): Promise<Match> {
   const page = await api.catalog.search(title.title);
   const matched = findMatch(title, page.items);
   if (!matched) {
@@ -41,18 +42,12 @@ async function findSources(title: DiscoverTitle): Promise<Match> {
       `“${title.title}”${title.year ? ` (${title.year})` : ""} is not in the download catalogue yet.`,
     );
   }
-  // Details come from the download catalogue, not the browse one, so the two
-  // descriptions can be compared before committing to gigabytes.
-  const [sources, details] = await Promise.all([
-    api.catalog.sources(matched.id),
-    api.catalog.details(matched.id).catch(() => null),
-  ]);
+  const details = await api.catalog.details(matched.id).catch(() => null);
   return {
     catalogId: matched.id,
     matchedTitle: matched.title,
     matchedYear: matched.year,
     details,
-    sources,
   };
 }
 
@@ -65,15 +60,20 @@ export function TitleModal({
   onClose: () => void;
   onQueued: () => void;
 }) {
+  const isSeries = title.media_kind === "series";
   const [match, setMatch] = useState<Match | null>(null);
+  const [sources, setSources] = useState<SourceOption[] | null>(null);
+  const [episode, setEpisode] = useState<Episode | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [queueing, setQueueing] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     setMatch(null);
+    setSources(null);
+    setEpisode(null);
     setError(null);
-    findSources(title)
+    findEntry(title)
       .then((found) => active && setMatch(found))
       .catch((cause: Error) => active && setError(cause.message));
     return () => {
@@ -81,12 +81,36 @@ export function TitleModal({
     };
   }, [title]);
 
-  // Escape is the expected way out of a modal that covers the page.
+  const loadSources = useCallback(
+    (chosen: Episode | null) => {
+      if (!match) return;
+      setSources(null);
+      setError(null);
+      api.catalog
+        .sources(match.catalogId, chosen ?? undefined)
+        .then(setSources)
+        .catch(() => setError("No sources are available for this selection."));
+    },
+    [match],
+  );
+
+  // A film has one set of sources; a show has one per episode, so nothing is
+  // fetched until an episode is chosen.
+  useEffect(() => {
+    if (!match) return;
+    if (!isSeries) loadSources(null);
+  }, [match, isSeries, loadSources]);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => event.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  function chooseEpisode(chosen: Episode) {
+    setEpisode(chosen);
+    loadSources(chosen);
+  }
 
   async function queue(source: SourceOption) {
     if (!match) return;
@@ -98,6 +122,9 @@ export function TitleModal({
         source_id: source.id,
         subtitle_id: null,
         requested_height: source.height,
+        // A show downloads one episode at a time, so the queued job has to say
+        // which one; a film carries neither field.
+        ...(episode ? { season: episode.season, episode: episode.episode } : {}),
       });
       onQueued();
       onClose();
@@ -107,6 +134,8 @@ export function TitleModal({
       setQueueing(null);
     }
   }
+
+  const seasons = match?.details?.seasons ?? [];
 
   return (
     <div
@@ -118,7 +147,11 @@ export function TitleModal({
     >
       <div className="modal">
         <div className="modal-art">
-          {title.backdrop_url && <img src={title.backdrop_url} alt="" />}
+          {/* Not every title has a landscape still; the poster is better than a
+              black rectangle. */}
+          {(title.backdrop_url || title.poster_url) && (
+            <img src={title.backdrop_url ?? title.poster_url ?? ""} alt="" />
+          )}
           <button className="modal-close" onClick={onClose} aria-label="Close">
             ✕
           </button>
@@ -127,27 +160,21 @@ export function TitleModal({
           <h2>{title.title}</h2>
           <div className="hero-meta">
             {title.year && <span>{title.year}</span>}
-            {title.rating != null && (
-              <span className="rating">{title.rating.toFixed(1)}</span>
-            )}
+            {title.rating != null && <span className="rating">{title.rating.toFixed(1)}</span>}
             {title.language && <span>{title.language.toUpperCase()}</span>}
+            <span className="badge badge-good">{isSeries ? "Series" : "Film"}</span>
           </div>
           {title.overview && <p style={{ color: "var(--ink-soft)" }}>{title.overview}</p>}
 
           {error && <p className="error-note">{error}</p>}
-
-          {!match && !error && <p className="empty">Finding sources…</p>}
+          {!match && !error && <p className="empty">Finding this title…</p>}
 
           {match && (
-            <div className="source-list">
+            <>
               {/* Show the matched entry as the download catalogue describes it.
-                  A wrong match is only dangerous while it stays invisible, so
-                  the artwork and the provider's own metadata are put in front of
-                  the user before any source can be chosen. */}
+                  A wrong match is only dangerous while it stays invisible. */}
               <div className="verify">
-                {title.poster_url && (
-                  <img className="verify-art" src={title.poster_url} alt="" />
-                )}
+                {title.poster_url && <img className="verify-art" src={title.poster_url} alt="" />}
                 <div>
                   <p className="verify-label">About to download</p>
                   <p className="verify-title">
@@ -171,24 +198,70 @@ export function TitleModal({
                   )}
                 </div>
               </div>
-              {match.sources.map((source) => (
-                <button
-                  key={source.id}
-                  className="source"
-                  onClick={() => queue(source)}
-                  disabled={queueing !== null}
-                >
-                  <span className="source-label">{source.label}</span>
-                  <span className={`badge badge-${source.quality}`}>
-                    {QUALITY_COPY[source.quality]}
-                  </span>
-                  {source.recommended && <span className="badge badge-good">Recommended</span>}
-                  <span className="source-size">
-                    {queueing === source.id ? "Queueing…" : formatSize(source.size_bytes)}
-                  </span>
-                </button>
-              ))}
-            </div>
+
+              {isSeries && seasons.length > 0 && (
+                <div className="seasons">
+                  {seasons.map((season) => (
+                    <div key={season.number}>
+                      <p className="verify-label">Season {season.number}</p>
+                      <div className="episode-grid">
+                        {season.episodes.map((item) => {
+                          const chosen =
+                            episode?.season === season.number && episode?.episode === item.number;
+                          return (
+                            <button
+                              key={`${season.number}-${item.number}`}
+                              className="episode"
+                              aria-pressed={chosen}
+                              onClick={() =>
+                                chooseEpisode({ season: season.number, episode: item.number })
+                              }
+                            >
+                              <span className="episode-number">E{item.number}</span>
+                              {item.title && <span className="episode-title">{item.title}</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {isSeries && seasons.length === 0 && (
+                <p className="empty">This show has no episodes listed yet.</p>
+              )}
+
+              {isSeries && !episode && seasons.length > 0 && (
+                <p className="empty">Choose an episode to see its download options.</p>
+              )}
+
+              {(!isSeries || episode) && !sources && !error && (
+                <p className="empty">Finding sources…</p>
+              )}
+
+              {sources && (
+                <div className="source-list">
+                  {sources.map((source) => (
+                    <button
+                      key={source.id}
+                      className="source"
+                      onClick={() => queue(source)}
+                      disabled={queueing !== null}
+                    >
+                      <span className="source-label">{source.label}</span>
+                      <span className={`badge badge-${source.quality}`}>
+                        {QUALITY_COPY[source.quality]}
+                      </span>
+                      {source.recommended && <span className="badge badge-good">Recommended</span>}
+                      <span className="source-size">
+                        {queueing === source.id ? "Queueing…" : formatSize(source.size_bytes)}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
