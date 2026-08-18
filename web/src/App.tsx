@@ -3,10 +3,11 @@ import { api, setUnauthorizedHandler } from "./api/client";
 import type { DiscoverTitle, Session } from "./api/types";
 import { LoginPage } from "./features/auth/LoginPage";
 import { BrowsePage } from "./features/browse/BrowsePage";
+import { HindiPage } from "./features/browse/HindiPage";
 import { TitleModal } from "./features/browse/TitleModal";
 import { QueuePage } from "./features/queue/QueuePage";
 
-type View = "browse" | "queue";
+type View = "browse" | "hindi" | "queue";
 
 function TopNav({
   view,
@@ -40,6 +41,9 @@ function TopNav({
       <nav>
         <button aria-current={view === "browse"} onClick={() => setView("browse")}>
           Browse
+        </button>
+        <button aria-current={view === "hindi"} onClick={() => setView("hindi")}>
+          Hindi
         </button>
         <button aria-current={view === "queue"} onClick={() => setView("queue")}>
           Downloads
@@ -81,9 +85,20 @@ function Shell({ session, signOut }: { session: Session; signOut: () => Promise<
         setQuery={setQuery}
         signOut={signOut}
       />
-      {view === "browse" ? (
-        <BrowsePage name={session.display_name} query={query} onSelect={setSelected} />
-      ) : (
+      {view === "browse" && (
+        <BrowsePage
+          key={queueVersion}
+          name={session.display_name}
+          query={query}
+          onSelect={setSelected}
+        />
+      )}
+      {view === "hindi" && (
+        <div style={{ paddingTop: 96 }}>
+          <HindiPage key={queueVersion} onSelect={setSelected} />
+        </div>
+      )}
+      {view === "queue" && (
         <div style={{ paddingTop: 96 }}>
           <QueuePage key={queueVersion} />
         </div>

@@ -854,3 +854,72 @@ img {
   background: rgba(229, 9, 20, 0.92);
   color: var(--ink);
 }
+
+/* ---------------------------------------------------------------- section */
+
+.section {
+  padding: var(--space-6) var(--gutter) var(--space-8);
+}
+
+.section-head h1 {
+  margin: 0 0 var(--space-1);
+  font-size: var(--step-title);
+  font-weight: 800;
+  letter-spacing: -0.025em;
+}
+
+.filters {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: var(--space-5) 0 var(--space-6);
+}
+
+.filter-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.chip {
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-card);
+  color: var(--ink-soft);
+  font-size: var(--step-small);
+  font-weight: 600;
+  transition: background var(--speed) var(--ease-out), border-color var(--speed) var(--ease-out),
+    color var(--speed) var(--ease-out);
+}
+
+.chip:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+/* The selected filter has to be unmistakable: the grid below changes wholesale
+   when it moves, and an ambiguous state makes the results look wrong. */
+.chip[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+/* A grid rather than a row: a section is for finding something specific, so it
+   shows everything at once instead of hiding most of it off-screen. */
+.poster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(128px, 13vw, 190px), 1fr));
+  gap: var(--space-4) var(--row-gap);
+}
+
+.poster-grid .card {
+  width: 100%;
+}
+
+/* Scaling inside a grid would overlap neighbours, so lift instead. */
+.poster-grid .card:hover,
+.poster-grid .card:focus-visible {
+  transform: translateY(-4px);
+}

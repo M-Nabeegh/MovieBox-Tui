@@ -48,6 +48,12 @@ export const api = {
     rows: () => api.request<DiscoverRow[]>("/discover"),
     search: (query: string) =>
       api.request<DiscoverTitle[]>(`/discover/search?q=${encodeURIComponent(query)}`),
+    /** Titles narrowed to one language, and optionally one year. */
+    filter: (options: { language: string; year: number | null; kind: "movie" | "series" }) => {
+      const params = new URLSearchParams({ language: options.language, kind: options.kind });
+      if (options.year !== null) params.set("year", String(options.year));
+      return api.request<DiscoverTitle[]>(`/discover/filter?${params}`);
+    },
   },
 
   catalog: {

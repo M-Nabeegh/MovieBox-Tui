@@ -20,8 +20,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Error)]
 pub enum TmdbError {
-    #[error("TMDB is not configured")]
-    NotConfigured,
     #[error("TMDB request failed")]
     Unavailable,
     #[error("TMDB returned an unexpected response")]
