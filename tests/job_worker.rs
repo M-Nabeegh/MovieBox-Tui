@@ -1135,3 +1135,131 @@ async fn recovery_requeues_finalizing_job_without_recorded_size() {
 
     assert_eq!(store.job(job.id).await.state, JobState::Queued);
 }
+
+/// Records the sync requests the worker made, and whether it claimed a change.
+#[derive(Debug, Default)]
+struct RecordingSyncer {
+    calls: Mutex<Vec<(PathBuf, PathBuf)>>,
+}
+
+impl RecordingSyncer {
+    async fn calls(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.calls.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl moviebox_tui::server::library::SubtitleSyncer for RecordingSyncer {
+    async fn sync(&self, video: &Path, subtitle: &Path) -> bool {
+        self.calls
+            .lock()
+            .await
+            .push((video.to_path_buf(), subtitle.to_path_buf()));
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_downloaded_subtitle_is_aligned_against_its_video() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let mut job = build_job(&harness.media_root, "sync", JobState::Queued);
+    job.subtitle_id = Some(SubtitleId::new("subtitle-en".to_string()));
+    job.final_subtitle_path = Some(job.final_video_path.replace(".mkv", ".English.srt"));
+    job.partial_subtitle_path = Some(
+        job.partial_video_path
+            .replace(".mkv.part", ".English.srt.part"),
+    );
+
+    let with_subtitle = || ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: Some(ResolvedSubtitle {
+            url: server.url("/download"),
+            headers: FixtureServer::required_headers(),
+            language: "English".to_string(),
+            extension: "srt".to_string(),
+        }),
+        extension: "mkv".to_string(),
+        expected_size: Some(server.content_len() as u64),
+    };
+    let catalog = Arc::new(MockCatalog::new([Ok(with_subtitle()), Ok(with_subtitle())]));
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let syncer = Arc::new(RecordingSyncer::default());
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(moviebox_tui::server::jobs::HttpTransferClient::new(
+            server.client(),
+        )),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)))
+    .with_subtitle_syncer(syncer.clone());
+
+    worker.run_once().await.unwrap();
+
+    let completed = store.job(job.id).await;
+    assert_eq!(completed.state, JobState::Ready);
+
+    // Alignment must run against the finished files in the library, not the
+    // scratch copies, which are gone by the time the job is ready.
+    let calls = syncer.calls().await;
+    assert_eq!(
+        calls.len(),
+        1,
+        "the subtitle should be aligned exactly once"
+    );
+    let (video, subtitle) = &calls[0];
+    // Compare resolved paths: the worker canonicalizes, and on macOS the
+    // temporary directory reaches the same files through a symlinked prefix.
+    let expect = |relative: &str| {
+        harness
+            .media_root
+            .join(relative)
+            .canonicalize()
+            .expect("the finished file exists")
+    };
+    assert_eq!(
+        video.canonicalize().unwrap(),
+        expect(&completed.final_video_path)
+    );
+    assert_eq!(
+        subtitle.canonicalize().unwrap(),
+        expect(completed.final_subtitle_path.as_ref().unwrap())
+    );
+    assert!(subtitle.exists());
+}
+
+#[tokio::test]
+async fn a_download_without_a_subtitle_is_never_sent_for_alignment() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(8 * 1024).await.unwrap();
+    let job = build_job(&harness.media_root, "no-sync", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: Some(server.content_len() as u64),
+    })]));
+    let syncer = Arc::new(RecordingSyncer::default());
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(moviebox_tui::server::jobs::HttpTransferClient::new(
+            server.client(),
+        )),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)))
+    .with_subtitle_syncer(syncer.clone());
+
+    worker.run_once().await.unwrap();
+
+    assert_eq!(store.job(job.id).await.state, JobState::Ready);
+    assert!(syncer.calls().await.is_empty());
+}

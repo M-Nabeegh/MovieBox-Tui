@@ -20,8 +20,12 @@ FROM debian:bookworm-slim AS runtime
 ARG APP_UID=1000
 ARG APP_GID=1000
 
+# ffmpeg and ffsubsync align a downloaded subtitle against the video audio.
+# Without them the server still runs; subtitles are simply left unaligned.
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates curl \
+    && apt-get install --no-install-recommends --yes \
+        ca-certificates curl ffmpeg python3 python3-pip \
+    && pip3 install --no-cache-dir --break-system-packages ffsubsync \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${APP_GID}" moviebox \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin moviebox \

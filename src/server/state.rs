@@ -12,7 +12,9 @@ use crate::server::{
         HttpTransferClient, JobRepository, JobSignal, JobWorker, LibraryRefresher,
         NoopLibraryRefresher, recover_interrupted_jobs, sweep_orphaned_partials,
     },
-    library::{LibraryNamer, jellyfin::JellyfinClient},
+    library::{
+        FfsubsyncSyncer, LibraryNamer, NoopSubtitleSyncer, SubtitleSyncer, jellyfin::JellyfinClient,
+    },
     notify::{DownloadNotifier, NoopNotifier, WebhookNotifier},
 };
 use crate::{
@@ -86,6 +88,7 @@ impl AppState {
         .with_reserve_bytes(self.inner.config.reserve_bytes)
         .with_library_refresher(library)
         .with_notifier(self.completion_notifier())
+        .with_subtitle_syncer(self.subtitle_syncer())
         .with_signal(self.inner.signal.clone());
 
         tokio::spawn(async move {
@@ -121,6 +124,19 @@ impl AppState {
                 );
                 Arc::new(NoopLibraryRefresher)
             }
+        }
+    }
+
+    /// Build the subtitle aligner used after a subtitle is downloaded.
+    ///
+    /// Alignment needs an external tool. When it is absent the syncer simply
+    /// reports that nothing changed, so a server without it keeps working and
+    /// keeps its subtitles, just unaligned.
+    fn subtitle_syncer(&self) -> Arc<dyn SubtitleSyncer> {
+        if self.inner.config.subtitle_autosync {
+            Arc::new(FfsubsyncSyncer::default())
+        } else {
+            Arc::new(NoopSubtitleSyncer)
         }
     }
 

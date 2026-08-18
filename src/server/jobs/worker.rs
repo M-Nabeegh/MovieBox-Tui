@@ -32,6 +32,7 @@ use crate::{
     server::{
         events::JobEventBus,
         library::LibraryNamer,
+        library::{NoopSubtitleSyncer, SubtitleSyncer},
         notify::{DownloadNotifier, NoopNotifier},
         security::path::contained_path,
     },
@@ -326,6 +327,8 @@ where
     // Kept as a trait object rather than another generic parameter: it is called
     // once per finished download, so dispatch cost is irrelevant here.
     notifier: Arc<dyn DownloadNotifier>,
+    /// Realigns a downloaded subtitle against the video it belongs to.
+    subsync: Arc<dyn SubtitleSyncer>,
     signal: JobSignal,
     reserve_bytes: u64,
     throttled_warnings: Arc<Mutex<HashMap<JobId, Instant>>>,
@@ -344,6 +347,7 @@ impl<S, C, T, D, L: ?Sized> Clone for JobWorker<S, C, T, D, L> {
             disk: Arc::clone(&self.disk),
             library: Arc::clone(&self.library),
             notifier: Arc::clone(&self.notifier),
+            subsync: Arc::clone(&self.subsync),
             signal: self.signal.clone(),
             reserve_bytes: self.reserve_bytes,
             throttled_warnings: Arc::clone(&self.throttled_warnings),
@@ -373,6 +377,7 @@ where
             disk: Arc::new(SystemDiskSpaceChecker),
             library: Arc::new(NoopLibraryRefresher),
             notifier: Arc::new(NoopNotifier),
+            subsync: Arc::new(NoopSubtitleSyncer),
             signal: JobSignal::new(),
             reserve_bytes: DEFAULT_RESERVE_BYTES,
             throttled_warnings: Arc::new(Mutex::new(HashMap::new())),
@@ -401,6 +406,7 @@ where
             disk,
             library: self.library,
             notifier: self.notifier,
+            subsync: self.subsync,
             signal: self.signal.clone(),
             reserve_bytes: self.reserve_bytes,
             throttled_warnings: self.throttled_warnings,
@@ -420,6 +426,7 @@ where
             disk: self.disk,
             library,
             notifier: self.notifier,
+            subsync: self.subsync,
             signal: self.signal,
             reserve_bytes: self.reserve_bytes,
             throttled_warnings: self.throttled_warnings,
@@ -429,6 +436,12 @@ where
     /// Share the signal that wakes this worker when a job is queued.
     pub fn with_signal(mut self, signal: JobSignal) -> Self {
         self.signal = signal;
+        self
+    }
+
+    /// Align downloaded subtitles with the given syncer.
+    pub fn with_subtitle_syncer(mut self, subsync: Arc<dyn SubtitleSyncer>) -> Self {
+        self.subsync = subsync;
         self
     }
 
@@ -957,7 +970,16 @@ where
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::rename(absolute_destination, final_path).await?;
+        fs::rename(absolute_destination, &final_path).await?;
+
+        // Align the subtitle to the audio before it is published. A subtitle
+        // and a video routinely come from different releases, so the text can
+        // be right while the timings are seconds out. This runs against the
+        // finished video, which is already in place by now, and failure leaves
+        // the unaligned subtitle rather than none at all.
+        let video = self.contained_path(Path::new(&job.final_video_path))?;
+        self.subsync.sync(&video, &final_path).await;
+
         Ok(None)
     }
 

@@ -59,6 +59,8 @@ pub struct ServerConfig {
     pub log_format: LogFormat,
     /// Language attached automatically when a download names no subtitle.
     pub subtitle_preference: SubtitlePreference,
+    /// Realign downloaded subtitles against the video audio.
+    pub subtitle_autosync: bool,
     pub session_cookie_name: String,
     pub session_pepper: [u8; 32],
 }
@@ -146,6 +148,18 @@ impl ServerConfig {
             .get("MOVIEBOX_SUBTITLE_LANGUAGE")
             .map(|value| SubtitlePreference::parse(value))
             .unwrap_or_default();
+        // On by default: a subtitle that does not line up is the common case
+        // when text and video come from different releases, and the alignment
+        // step is skipped anyway when the tool is not installed.
+        let subtitle_autosync = env
+            .get("MOVIEBOX_SUBTITLE_AUTOSYNC")
+            .map(|value| {
+                let value = value.trim();
+                !(value.eq_ignore_ascii_case("off")
+                    || value.eq_ignore_ascii_case("false")
+                    || value == "0")
+            })
+            .unwrap_or(true);
         let session_pepper = derive_session_pepper(&session_key_file)?;
 
         Ok(Self {
@@ -171,6 +185,7 @@ impl ServerConfig {
             notify_link_url,
             log_format,
             subtitle_preference,
+            subtitle_autosync,
             session_cookie_name: COOKIE_NAME.to_string(),
             session_pepper,
         })
