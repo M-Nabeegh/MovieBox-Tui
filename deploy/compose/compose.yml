@@ -33,10 +33,14 @@ services:
       # Point at the secret only when the operator created it; an unset value
       # leaves the corresponding feature disabled.
       MOVIEBOX_JELLYFIN_API_KEY_FILE: "${MOVIEBOX_JELLYFIN_API_KEY_FILE:-}"
+      # Where a browser should be sent. The base URL above is a container name
+      # that only this server resolves, so links built from it are dead outside.
+      MOVIEBOX_JELLYFIN_PUBLIC_URL: "${MOVIEBOX_JELLYFIN_PUBLIC_URL:-}"
       MOVIEBOX_MCP_TOKEN_FILE: "${MOVIEBOX_MCP_TOKEN_FILE:-}"
       MOVIEBOX_TMDB_TOKEN_FILE: "${MOVIEBOX_TMDB_TOKEN_FILE:-}"
       MOVIEBOX_NOTIFY_WEBHOOK_URL_FILE: "${MOVIEBOX_NOTIFY_WEBHOOK_URL_FILE:-}"
       MOVIEBOX_NOTIFY_RECIPIENT: "${MOVIEBOX_NOTIFY_RECIPIENT:-}"
+      MOVIEBOX_DISPLAY_NAME: "${MOVIEBOX_DISPLAY_NAME:-}"
       MOVIEBOX_NOTIFY_LINK_URL: "${MOVIEBOX_NOTIFY_LINK_URL:-}"
       MOVIEBOX_LOG_FORMAT: text
     volumes:

@@ -91,6 +91,34 @@ impl JobRepository {
         Ok(job)
     }
 
+    /// Remove a finished job and its history.
+    ///
+    /// Only a job that can no longer run is removable: deleting one mid-flight
+    /// would leave the worker writing to a job that no longer exists.
+    pub async fn delete(&self, id: JobId) -> Result<(), JobRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let job = fetch_job_with_executor(&mut *tx, id).await?;
+        if !matches!(
+            job.state,
+            JobState::Failed | JobState::Cancelled | JobState::Ready
+        ) {
+            return Err(JobRepositoryError::InvalidTransition {
+                from: job.state,
+                to: JobState::Cancelled,
+            });
+        }
+        sqlx::query("DELETE FROM job_events WHERE job_id = ?1")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM jobs WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn claim_next(&self) -> Result<Option<DownloadJob>, JobRepositoryError> {
         let mut tx = self.pool.begin().await?;
         let now = now_millis()?;

@@ -177,3 +177,37 @@ test("a failing library lookup does not break the finished card", async () => {
   expect(await screen.findByText(/not indexed by nabeeghfin yet/i)).toBeVisible();
   fetchMock.mockRestore();
 });
+
+test("a failed job can be cleared from the queue", async () => {
+  const user = userEvent.setup();
+  const deleted: string[] = [];
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    if ((init?.method ?? "GET") === "DELETE") {
+      deleted.push(url);
+      return new Response(null, { status: 204 });
+    }
+    return json(jobs.filter((j) => j.state === "failed"));
+  });
+
+  render(<QueuePage />);
+  await screen.findByText("Failed Movie");
+  await user.click(screen.getByRole("button", { name: "Remove" }));
+
+  await waitFor(() => expect(deleted).toHaveLength(1));
+  expect(deleted[0]).toContain("/jobs/failed-1");
+  fetchMock.mockRestore();
+});
+
+test("an in-flight job offers no way to remove it", async () => {
+  const fetchMock = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async () => json(jobs.filter((j) => j.state === "downloading")));
+
+  render(<QueuePage />);
+  await screen.findByText("Downloading Movie");
+  // Removing a running job would leave the worker writing to a record that is
+  // no longer there.
+  expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+  fetchMock.mockRestore();
+});

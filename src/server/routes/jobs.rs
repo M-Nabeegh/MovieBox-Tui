@@ -21,7 +21,7 @@ use uuid::Uuid;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/jobs", get(list).post(create))
-        .route("/jobs/{id}", get(get_one))
+        .route("/jobs/{id}", get(get_one).delete(remove))
         .route("/jobs/{id}/pause", post(pause))
         .route("/jobs/{id}/resume", post(resume))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -281,6 +281,22 @@ pub(crate) async fn enqueue_download(
     state.events().publish_job(&job, JobEventKind::Created);
     state.signal().wake();
     Ok(job)
+}
+
+/// Remove a finished job from the queue.
+///
+/// Only a job that can no longer run is removable, so a failed attempt can be
+/// cleared away without touching anything still in flight. Media already in the
+/// library is left alone: this clears the record, not the film.
+async fn remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    mutation_session(&state, &headers).await?;
+    let id = parse_id(&id)?;
+    state.jobs().delete(id).await.map_err(map_job_error)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn pause(

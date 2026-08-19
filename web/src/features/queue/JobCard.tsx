@@ -44,6 +44,9 @@ export function JobCard({ job, onChanged }: { job: Job; onChanged: () => void })
           ? "retry"
           : null;
   const cancellable = ["queued", "resolving", "downloading", "paused"].includes(job.state);
+  // A job that can no longer run is only clutter. Removing it clears the
+  // record; anything already in the library stays where it is.
+  const removable = ["failed", "cancelled"].includes(job.state);
   const percent =
     job.total_bytes && job.total_bytes > 0
       ? Math.min(100, (job.downloaded_bytes / job.total_bytes) * 100)
@@ -57,6 +60,16 @@ export function JobCard({ job, onChanged }: { job: Job; onChanged: () => void })
     } finally {
       setWorking(false);
       setConfirming(false);
+    }
+  }
+
+  async function remove() {
+    setWorking(true);
+    try {
+      await api.jobs.remove(job.id);
+      onChanged();
+    } finally {
+      setWorking(false);
     }
   }
 
@@ -95,11 +108,16 @@ export function JobCard({ job, onChanged }: { job: Job; onChanged: () => void })
         </p>
       )}
 
-      {(action || cancellable) && (
+      {(action || cancellable || removable) && (
         <div className="job-actions">
           {action && (
             <button className="btn btn-ghost" disabled={working} onClick={() => run(action)}>
               {action === "pause" ? "Pause" : action === "resume" ? "Resume" : "Retry"}
+            </button>
+          )}
+          {removable && (
+            <button className="btn btn-quiet" disabled={working} onClick={remove}>
+              Remove
             </button>
           )}
           {cancellable && !confirming && (

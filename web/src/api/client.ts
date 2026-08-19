@@ -80,6 +80,8 @@ export const api = {
 
   jobs: {
     list: () => api.request<Job[]>("/jobs"),
+    remove: (id: string) =>
+      api.request<void>(`/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
     action: (id: string, action: "pause" | "resume" | "cancel" | "retry", version: number) =>
       api.request<Job>(`/jobs/${encodeURIComponent(id)}/${action}`, {
         method: "POST",
