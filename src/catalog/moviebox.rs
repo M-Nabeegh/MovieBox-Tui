@@ -659,7 +659,7 @@ impl CatalogProvider for MovieBoxCatalogProvider {
 
         Ok(ResolvedSource {
             url,
-            headers: HeaderMap::new(),
+            headers: self.client.media_headers(),
             subtitle: resolved_subtitle,
             extension,
             expected_size,

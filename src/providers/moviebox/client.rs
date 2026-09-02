@@ -1,5 +1,6 @@
 use crate::providers::moviebox::crypto::build_signed_headers;
 use reqwest::Response;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -72,6 +73,18 @@ impl MovieBoxClient {
 
     pub fn http_client(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    /// Headers required when using a resolved MovieBox media URL.
+    ///
+    /// The CDN checks the Android identity independently of the signed API
+    /// request and substitutes a short notice video when it is absent.
+    pub fn media_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&self.user_agent) {
+            headers.insert(USER_AGENT, value);
+        }
+        headers
     }
 
     pub async fn init(&self) -> Result<(), ScraperError> {
@@ -249,5 +262,24 @@ impl MovieBoxClient {
         } else {
             Ok(body_val)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MovieBoxClient;
+    use reqwest::header::USER_AGENT;
+
+    #[test]
+    fn media_requests_forward_the_same_mobile_identity_as_api_requests() {
+        let client = MovieBoxClient::new();
+        let headers = client.media_headers();
+
+        assert_eq!(
+            headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(client.user_agent.as_str())
+        );
     }
 }

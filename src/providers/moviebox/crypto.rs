@@ -228,7 +228,7 @@ pub(crate) fn generate_client_info_and_ua() -> (String, String) {
         ("M2012K11AG", "Redmi"),
         ("M2007J20CG", "Redmi"),
     ];
-    let version_codes = [50020042, 50020043, 50020044, 50020045, 50020046];
+    let version_codes = [50020117, 50020118, 50020119, 50020120, 50020121];
     let network_types = ["NETWORK_WIFI", "NETWORK_MOBILE"];
     let timezones = [
         "Asia/Kolkata",
@@ -252,7 +252,7 @@ pub(crate) fn generate_client_info_and_ua() -> (String, String) {
     );
 
     let client_info = format!(
-        r#"{{"package_name":"com.community.oneroom","version_name":"3.0.03.0529.03","version_code":{},"os":"android","os_version":"{}","install_ch":"ps","device_id":"{}","install_store":"ps","gaid":"{}","brand":"{}","model":"{}","system_language":"en","net":"{}","region":"US","timezone":"{}","sp_code":"40401","X-Play-Mode":"2"}}"#,
+        r#"{{"package_name":"com.community.oneroom","version_name":"4.0.01.0813.03","version_code":{},"os":"android","os_version":"{}","install_ch":"ps","device_id":"{}","install_store":"ps","gaid":"{}","brand":"{}","model":"{}","system_language":"en","net":"{}","region":"US","timezone":"{}","sp_code":"40401","X-Play-Mode":"2"}}"#,
         version_code, android.0, device_id, gaid, device.1, device.0, network, timezone
     );
 
@@ -290,4 +290,22 @@ pub(crate) fn random_spoofed_ip() -> String {
     let c: u8 = rng.random_range(1..254);
     let d: u8 = rng.random_range(1..254);
     format!("{}.{}.{}", prefix, c, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_client_info_and_ua;
+
+    #[test]
+    fn generated_identity_matches_the_current_moviebox_android_app() {
+        let (user_agent, client_info) = generate_client_info_and_ua();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&client_info).expect("valid client info JSON");
+
+        assert!(user_agent.contains("com.community.oneroom/500201"));
+        assert!(user_agent.contains("Cronet/135.0.7012.3"));
+        assert_eq!(parsed["version_name"], "4.0.01.0813.03");
+        let version_code = parsed["version_code"].as_i64().expect("numeric version");
+        assert!((50020117..=50020121).contains(&version_code));
+    }
 }
