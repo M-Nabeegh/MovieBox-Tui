@@ -626,6 +626,51 @@ async fn worker_completes_one_job_and_finalizes_into_the_library() {
 }
 
 #[tokio::test]
+async fn worker_rejects_a_transfer_smaller_than_the_catalog_advertised() {
+    let harness = WorkerHarness::new();
+    let server = FixtureServer::start(256 * 1024).await.unwrap();
+    let job = build_job(
+        &harness.media_root,
+        "short-provider-response",
+        JobState::Queued,
+    );
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(ResolvedSource {
+        url: server.url("/download"),
+        headers: FixtureServer::required_headers(),
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: Some((server.content_len() * 2) as u64),
+    })]));
+    let worker = harness.worker(
+        store.clone(),
+        catalog,
+        moviebox_tui::server::jobs::HttpTransferClient::new(server.client()),
+        JobEventBus::new(16),
+        Arc::new(MockDiskSpace::new(
+            DEFAULT_RESERVE_BYTES + (server.content_len() * 2) as u64 + 1,
+        )),
+    );
+
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        WorkerRunOutcome::Progressed
+    );
+
+    let rejected = store.job(job.id).await;
+    assert_eq!(rejected.state, JobState::Queued);
+    assert_eq!(rejected.error_code.as_deref(), Some("incomplete_download"));
+    assert_eq!(
+        rejected.total_bytes,
+        Some((server.content_len() * 2) as u64)
+    );
+    assert!(
+        !harness.media_root.join(&rejected.final_video_path).exists(),
+        "a response that contradicts the catalog size must not enter the library"
+    );
+}
+
+#[tokio::test]
 async fn transfer_failure_after_progress_does_not_stop_worker_on_version_conflict() {
     let harness = WorkerHarness::new();
     let server = FixtureServer::start(8 * 1024).await.unwrap();

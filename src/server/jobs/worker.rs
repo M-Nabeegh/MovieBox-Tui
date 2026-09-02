@@ -594,6 +594,11 @@ where
             .await?;
         self.publish(&downloading, JobEventKind::StateChanged);
 
+        // Keep the catalog's full-file size across the transfer. A CDN error
+        // page or promotional clip can be a perfectly complete HTTP response
+        // with its own (much smaller) Content-Length; trusting that response
+        // alone would publish the wrong video as a successful download.
+        let catalog_expected_size = resolved.expected_size.filter(|size| *size > 0);
         let download = self.download_with_refresh(downloading, resolved).await?;
         let completed = match download {
             Some(job) => job,
@@ -608,10 +613,8 @@ where
                 JobState::Finalizing,
                 JobEventKind::StateChanged,
                 JobStatePatch {
-                    downloaded_bytes: Some(
-                        completed.total_bytes.unwrap_or(completed.downloaded_bytes),
-                    ),
-                    total_bytes: Some(completed.total_bytes),
+                    downloaded_bytes: Some(completed.downloaded_bytes),
+                    total_bytes: Some(catalog_expected_size.or(completed.total_bytes)),
                     speed_bytes_per_second: Some(None),
                     warning: Some(completed.warning.clone()),
                     ..Default::default()
