@@ -1043,6 +1043,9 @@ fn parse_dash_manifest(
             }
             Event::Text(text_event) => {
                 let text_value = text_event.as_ref();
+                if stack.is_empty() && root_closed && !text_value.trim().is_empty() {
+                    return Err(DashError::InvalidManifest("text outside MPD root"));
+                }
                 if let Some(element) = stack.last_mut()
                     && element.is_base
                 {
@@ -1057,6 +1060,9 @@ fn parse_dash_manifest(
                 }
             }
             Event::GeneralRef(reference) => {
+                if stack.is_empty() && root_closed {
+                    return Err(DashError::InvalidManifest("reference outside MPD root"));
+                }
                 let value = decode_xml_entities(&format!("&{};", reference.as_ref()))?;
                 if let Some(element) = stack.last_mut()
                     && element.is_base
