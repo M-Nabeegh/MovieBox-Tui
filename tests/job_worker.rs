@@ -138,6 +138,31 @@ impl TransferClient for FailingTransfer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProxyNetworkTransfer;
+
+#[async_trait]
+impl TransferClient for ProxyNetworkTransfer {
+    async fn transfer(
+        &self,
+        _request: DownloadRequest,
+        _destination: &Path,
+        _cancel: CancellationToken,
+        progress: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<DownloadOutcome, TransferError> {
+        progress
+            .send(TransferProgress {
+                downloaded_bytes: 7,
+                total_bytes: None,
+                speed_bytes_per_second: None,
+            })
+            .unwrap();
+        Err(TransferError::Dash(
+            moviebox_tui::server::jobs::dash::DashError::ProxyNetwork,
+        ))
+    }
+}
+
 #[derive(Clone, Default)]
 struct RefreshingTransfer {
     calls: Arc<AtomicUsize>,
@@ -935,6 +960,42 @@ async fn transfer_failure_keeps_partial_bytes_for_the_next_attempt() {
     assert!(
         partial.exists(),
         "a retryable failure must not discard downloaded bytes"
+    );
+}
+
+#[tokio::test]
+async fn dash_proxy_network_failure_requeues_and_keeps_partial_bytes() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "dash-proxy-network", JobState::Queued);
+    let partial = harness
+        .media_root
+        .join(job.partial_video_path.trim_end_matches(".part"));
+    fs::create_dir_all(partial.parent().unwrap()).await.unwrap();
+    fs::write(&partial, vec![9_u8; 4096]).await.unwrap();
+
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(resolved_source(
+        "http://example.com/index.mpd",
+        Some(10),
+    ))]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(ProxyNetworkTransfer),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
+    let after = store.job(job.id).await;
+    assert_eq!(after.state, JobState::Queued);
+    assert_eq!(after.error_code.as_deref(), Some("download_failed"));
+    assert!(after.next_attempt_at.is_some());
+    assert!(
+        partial.exists(),
+        "proxy network retries must preserve partials"
     );
 }
 

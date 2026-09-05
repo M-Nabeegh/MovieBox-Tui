@@ -852,18 +852,6 @@ where
                     }
                     return Ok(None);
                 }
-                Err(TransferError::Dash(super::dash::DashError::ProxyNetwork)) => {
-                    let current = self.store.get(downloading.id).await?;
-                    if current.state == JobState::Downloading {
-                        self.fail_current_job(
-                            downloading.id,
-                            "download_failed",
-                            "DASH proxy network failure",
-                        )
-                        .await?;
-                    }
-                    return Ok(None);
-                }
                 Err(error) => {
                     // The transfer layer already exhausted its own in-place
                     // retries, so hand the job back to the queue with a backoff
