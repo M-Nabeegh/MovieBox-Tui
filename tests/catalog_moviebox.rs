@@ -276,3 +276,80 @@ fn play_info_fails_closed_when_resource_episode_identity_does_not_match() {
 
     assert!(matches!(error, CatalogError::NotFound("source")));
 }
+
+#[test]
+fn play_info_falls_back_to_one_nonmatching_stream_when_identity_is_caller_validated() {
+    let mut payload = fixture("moviebox-play-info.json");
+    let mut stream = payload["data"]["streams"][1].clone();
+    stream["id"] = serde_json::json!("stream-live-opaque");
+    stream["resourceId"] = serde_json::json!("stream-live-opaque");
+    payload["data"]["streams"] = serde_json::json!([stream]);
+
+    let resolved = resolve_play_info_source(
+        &payload,
+        "resource-fixture-1080",
+        Some(1),
+        Some(2),
+        1080,
+        "FixtureAndroid/1.0",
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved.url.as_str(),
+        "https://cdn.example.invalid/dash/resource-fixture-1080/index.mpd"
+    );
+    assert_eq!(
+        resolved.transport,
+        SourceTransport::Dash {
+            maximum_height: 1080,
+            expected_duration_seconds: Some(5400.0),
+        }
+    );
+}
+
+#[test]
+fn play_info_rejects_multiple_nonmatching_streams_without_exact_identity() {
+    let mut payload = fixture("moviebox-play-info.json");
+    let mut first = payload["data"]["streams"][1].clone();
+    first["id"] = serde_json::json!("stream-live-a");
+    first["resourceId"] = serde_json::json!("stream-live-a");
+    let mut second = first.clone();
+    second["id"] = serde_json::json!("stream-live-b");
+    second["resourceId"] = serde_json::json!("stream-live-b");
+    payload["data"]["streams"] = serde_json::json!([first, second]);
+
+    let error = resolve_play_info_source(
+        &payload,
+        "resource-fixture-1080",
+        Some(1),
+        Some(2),
+        1080,
+        "FixtureAndroid/1.0",
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CatalogError::NotFound("source")));
+}
+
+#[test]
+fn play_info_rejects_nonmatching_stream_with_contradictory_episode() {
+    let mut payload = fixture("moviebox-play-info.json");
+    let mut stream = payload["data"]["streams"][1].clone();
+    stream["id"] = serde_json::json!("stream-live-opaque");
+    stream["resourceId"] = serde_json::json!("stream-live-opaque");
+    stream["ep"] = serde_json::json!(9);
+    payload["data"]["streams"] = serde_json::json!([stream]);
+
+    let error = resolve_play_info_source(
+        &payload,
+        "resource-fixture-1080",
+        Some(1),
+        Some(2),
+        1080,
+        "FixtureAndroid/1.0",
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CatalogError::NotFound("source")));
+}

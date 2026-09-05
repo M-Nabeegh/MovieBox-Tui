@@ -263,6 +263,31 @@ fn stream_height_values(stream: &Value) -> Vec<u16> {
     values
 }
 
+fn candidate_height_for_stream(stream: &Value, data: &Value, requested_height: u16) -> Option<u16> {
+    let mut heights = stream_height_values(stream);
+    if heights.is_empty() {
+        if let Some(value) = data.get("displayResolutions") {
+            match value {
+                Value::String(text) => heights.extend(
+                    text.split(',')
+                        .filter_map(|part| part.trim().parse::<u16>().ok()),
+                ),
+                Value::Array(items) => heights.extend(items.iter().filter_map(|item| {
+                    item.as_u64()
+                        .and_then(|number| u16::try_from(number).ok())
+                        .or_else(|| item.as_str().and_then(|text| text.parse().ok()))
+                })),
+                _ => {}
+            }
+        }
+    }
+    heights
+        .into_iter()
+        .filter(|height| *height <= requested_height)
+        .max()
+        .or_else(|| stream_number(stream, &["resolution", "height"]).map(|value| value as u16))
+}
+
 /// Decode a signed CloudFront policy and derive the DASH manifest URL.
 ///
 /// The legacy URL field is intentionally ignored. It is where MovieBox has
@@ -331,8 +356,12 @@ fn is_public_dash_url(url: &Url) -> bool {
 }
 
 /// Adapt one authenticated play-info/v2 payload into the internal DASH
-/// transfer contract. Resolution and episode/resource identity are matched
-/// before a signed policy is accepted; no legacy notice URL is ever selected.
+/// transfer contract. Exact resource identity remains preferred. When the
+/// provider's episode-scoped payload contains one nonmatching stream, the
+/// caller's prior `get_resources`/source-item validation is the subject and
+/// resource identity precondition; this function then requires that sole
+/// stream's declared height, episode fields (when present), finite duration,
+/// and signed policy to be valid. No legacy notice URL is ever selected.
 pub fn resolve_play_info_source(
     payload: &Value,
     resource_id: &str,
@@ -354,6 +383,7 @@ pub fn resolve_play_info_source(
         .ok_or(CatalogError::InvalidPayload("streams"))?;
     let mut invalid_policy_for_match = false;
     let mut candidates = Vec::new();
+    let mut saw_exact_identity = false;
 
     for stream in streams {
         let id = stream_text(
@@ -363,6 +393,7 @@ pub fn resolve_play_info_source(
         if id != Some(resource_id) {
             continue;
         }
+        saw_exact_identity = true;
         let stream_se = ["se", "season", "seasonNumber"]
             .iter()
             .find_map(|&key| parse_optional_u16_field(stream, key));
@@ -374,13 +405,7 @@ pub fn resolve_play_info_source(
         {
             continue;
         }
-        let heights = stream_height_values(stream);
-        let candidate_height = heights
-            .iter()
-            .copied()
-            .filter(|height| *height <= requested_height)
-            .max()
-            .or_else(|| stream_number(stream, &["resolution", "height"]).map(|value| value as u16));
+        let candidate_height = candidate_height_for_stream(stream, data, requested_height);
         if candidate_height.is_none_or(|height| height > requested_height) {
             continue;
         }
@@ -402,6 +427,47 @@ pub fn resolve_play_info_source(
             sign_cookie,
             manifest_url,
         ));
+    }
+
+    if candidates.is_empty() && !saw_exact_identity && streams.len() == 1 {
+        let stream = &streams[0];
+        let Some(id) = stream_text(
+            stream,
+            &["resourceId", "resource_id", "streamId", "stream_id", "id"],
+        ) else {
+            return Err(CatalogError::NotFound("source"));
+        };
+        if id == resource_id {
+            return Err(CatalogError::NotFound("source"));
+        }
+        let stream_se = ["se", "season", "seasonNumber"]
+            .iter()
+            .find_map(|&key| parse_optional_u16_field(stream, key));
+        let stream_ep = ["ep", "episode", "episodeNumber"]
+            .iter()
+            .find_map(|&key| parse_optional_u16_field(stream, key));
+        if season.is_some_and(|wanted| stream_se.is_some_and(|actual| actual != wanted))
+            || episode.is_some_and(|wanted| stream_ep.is_some_and(|actual| actual != wanted))
+        {
+            return Err(CatalogError::NotFound("source"));
+        }
+        let Some(candidate_height) = candidate_height_for_stream(stream, data, requested_height)
+        else {
+            return Err(CatalogError::NotFound("source"));
+        };
+        if candidate_height > requested_height {
+            return Err(CatalogError::NotFound("source"));
+        }
+        let Some(sign_cookie) = stream.get("signCookie").and_then(Value::as_str) else {
+            return Err(CatalogError::InvalidPayload("signed CloudFront policy"));
+        };
+        let Some(manifest_url) = resolve_dash_manifest_from_policy(sign_cookie) else {
+            return Err(CatalogError::InvalidPayload("signed CloudFront policy"));
+        };
+        if HeaderValue::from_str(sign_cookie).is_err() {
+            return Err(CatalogError::InvalidPayload("signed cookie"));
+        }
+        candidates.push((candidate_height, stream, sign_cookie, manifest_url));
     }
 
     candidates.sort_by(|left, right| {
