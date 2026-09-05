@@ -1503,6 +1503,9 @@ fn rewrite_manifest_start(
         let attribute =
             attribute.map_err(|_| DashError::InvalidManifest("malformed XML attribute"))?;
         let key = xml_name(attribute.key.as_ref())?.to_string();
+        if key == "xsi:schemaLocation" {
+            continue;
+        }
         let value = attribute
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|_| DashError::UnsafeManifestReference)?
@@ -1962,6 +1965,48 @@ mod tests {
 
         let unsafe_id = br#"<MPD><Period><AdaptationSet><Representation id="../video"><SegmentTemplate media="seg-$RepresentationID$.m4s" /></Representation></AdaptationSet></Period></MPD>"#;
         assert!(parse_dash_manifest(unsafe_id, &remote, "opaque-token").is_err());
+    }
+
+    #[test]
+    fn schema_location_metadata_is_omitted_while_media_references_stay_guarded() {
+        let remote = Url::parse("https://cdn.example.invalid/index.mpd").unwrap();
+        let manifest = br#"<MPD xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:mpeg:dash:schema:mpd:2011 https://example.invalid/schema.xsd"><Period><SegmentTemplate media="segment-$Number$.m4s" /></Period></MPD>"#;
+        let parsed = parse_dash_manifest(manifest, &remote, "opaque-token").unwrap();
+        assert!(
+            !parsed
+                .bytes
+                .windows(b"schemaLocation".len())
+                .any(|window| { window == b"schemaLocation" })
+        );
+        assert!(
+            parsed
+                .bytes
+                .windows(b"/__dash/opaque-token/segment-$Number$.m4s".len())
+                .any(|window| window == b"/__dash/opaque-token/segment-$Number$.m4s")
+        );
+    }
+
+    #[test]
+    fn live_shaped_representation_templates_without_baseurl_are_rewritten() {
+        let remote = Url::parse("https://cdn.example.invalid/index.mpd").unwrap();
+        let manifest = br#"<MPD><Period><AdaptationSet><Representation id="v1" height="1080"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="seg-$RepresentationID$-$Number%05d$.m4s" /></Representation><Representation id="v2" height="720"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="seg-$RepresentationID$-$Number%05d$.m4s" /></Representation></AdaptationSet><AdaptationSet><Representation id="a1"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="seg-$RepresentationID$-$Number%05d$.m4s" /></Representation><Representation id="a2"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="seg-$RepresentationID$-$Number%05d$.m4s" /></Representation></AdaptationSet></Period></MPD>"#;
+        let parsed = parse_dash_manifest(manifest, &remote, "opaque-token").unwrap();
+        assert!(
+            parsed
+                .bytes
+                .windows(b"/__dash/opaque-token/init-$RepresentationID$.m4s".len())
+                .any(|window| { window == b"/__dash/opaque-token/init-$RepresentationID$.m4s" })
+        );
+        assert!(parsed.capabilities.iter().any(|capability| {
+            capability.path_template == "/init-$RepresentationID$.m4s"
+                && capability.matches("/init-v1.m4s", None)
+                && !capability.matches("/init-v3.m4s", None)
+        }));
+        assert!(parsed.capabilities.iter().any(|capability| {
+            capability.path_template == "/seg-$RepresentationID$-$Number%05d$.m4s"
+                && capability.matches("/seg-v1-00001.m4s", None)
+                && !capability.matches("/seg-v1-1.m4s", None)
+        }));
     }
 
     #[tokio::test]

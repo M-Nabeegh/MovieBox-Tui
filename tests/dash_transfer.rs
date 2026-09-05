@@ -295,6 +295,43 @@ async fn dash_transfer_preserves_literal_dollar_escaping_for_ffmpeg_routes() {
 }
 
 #[tokio::test]
+async fn dash_transfer_handles_live_shaped_representation_templates() {
+    let server = FixtureServer::start_dash(
+        dash_manifest_live_representation_templates(),
+        b"fixture-segment".to_vec(),
+    )
+    .await
+    .unwrap();
+    let tools = fake_media_tools(tempdir().unwrap(), FakeMediaOutput::LiveRepresentation);
+    let transfer = DashTransfer::with_tools(server.client(), &tools.ffmpeg, &tools.ffprobe);
+    let workspace = tempdir().unwrap();
+    let destination = workspace.path().join("live-shaped.mkv");
+
+    let result = transfer
+        .transfer(
+            dash_request(server.url("/manifest.mpd")),
+            &destination,
+            CancellationToken::new(),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, DownloadOutcome::Completed { bytes: 13 });
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/init-stream1.m4s")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/chunk-stream1-00001.m4s")
+    );
+}
+
+#[tokio::test]
 async fn dash_transfer_maps_guarded_segment_403_to_an_auth_error_and_cleans_up() {
     let server = FixtureServer::start_dash(dash_manifest(), b"fixture-segment".to_vec())
         .await
@@ -504,6 +541,11 @@ fn dash_manifest_literal_dollar() -> Vec<u8> {
         .to_vec()
 }
 
+fn dash_manifest_live_representation_templates() -> Vec<u8> {
+    br#"<MPD><Period><AdaptationSet contentType="video"><Representation id="stream0" height="1080"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$RepresentationID$-$Number%05d$.m4s" /></Representation><Representation id="stream1" height="720"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$RepresentationID$-$Number%05d$.m4s" /></Representation><Representation id="stream2" height="480"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$RepresentationID$-$Number%05d$.m4s" /></Representation></AdaptationSet><AdaptationSet contentType="audio"><Representation id="stream3"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$RepresentationID$-$Number%05d$.m4s" /></Representation></AdaptationSet></Period></MPD>"#
+        .to_vec()
+}
+
 fn dash_request(url: Url) -> DownloadRequest {
     DownloadRequest {
         url,
@@ -520,6 +562,7 @@ fn dash_request(url: Url) -> DownloadRequest {
 enum FakeMediaOutput {
     FeatureLength,
     LiteralDollar,
+    LiveRepresentation,
     NoVideo,
     Notice,
     Fail,
@@ -538,6 +581,7 @@ fn fake_media_tools(temp: TempDir, output: FakeMediaOutput) -> FakeMediaTools {
     let mode = match output {
         FakeMediaOutput::FeatureLength => "feature",
         FakeMediaOutput::LiteralDollar => "literal-dollar",
+        FakeMediaOutput::LiveRepresentation => "live-representation",
         FakeMediaOutput::NoVideo => "no-video",
         FakeMediaOutput::Notice => "notice",
         FakeMediaOutput::Fail => "fail",
@@ -576,6 +620,9 @@ headers_file="${{output}}.headers"
 segment="${{input%/*}}/segment.m4s"
 case "{mode}" in
   literal-dollar) segment="${{input%/*}}/segment-\$.m4s" ;;
+  live-representation)
+    curl --fail --silent "${{input%/*}}/init-stream1.m4s" >/dev/null
+    segment="${{input%/*}}/chunk-stream1-00001.m4s" ;;
 esac
 curl --fail --silent --range 0-2 -D "$headers_file" "$segment" >/dev/null
 grep -q '206 Partial Content' "$headers_file"
@@ -589,6 +636,7 @@ case "{mode}" in
     printf 'fixture-media' > "$output"
     ;;
   literal-dollar) printf 'fixture-media' > "$output" ;;
+  live-representation) printf 'fixture-media' > "$output" ;;
   feature) printf 'fixture-media' > "$output" ;;
   notice) dd if=/dev/zero of="$output" bs=917554 count=1 2>/dev/null ;;
   fail) exit 7 ;;
@@ -615,7 +663,23 @@ done
 case "$last" in
   http://127.0.0.1:*/manifest.mpd)
     [ "$protocol" = "http,tcp,tls,crypto" ] || exit 93
-    printf '%s\n' '{{"streams":[{{"index":0,"codec_type":"video","height":1080}},{{"index":1,"codec_type":"video","height":720}},{{"index":2,"codec_type":"audio"}}]}}'
+    case "{mode}" in
+      live-representation)
+        probe_headers="${{TMPDIR:-/tmp}}/moviebox-ffprobe-headers.$$"
+        trap 'rm -f "$probe_headers"' EXIT
+        curl --fail --silent -D "$probe_headers" "$last" >/dev/null
+        grep -q '200 OK' "$probe_headers"
+        for route in init-stream0.m4s chunk-stream0-00001.m4s init-stream1.m4s chunk-stream1-00001.m4s init-stream2.m4s chunk-stream2-00001.m4s init-stream3.m4s chunk-stream3-00001.m4s; do
+          curl --fail --silent -D "$probe_headers" "${{last%/*}}/$route" >/dev/null
+          grep -q '206 Partial Content' "$probe_headers"
+          grep -qi 'content-range: bytes 0-' "$probe_headers"
+        done
+        printf '%s\n' '{{"streams":[{{"index":0,"codec_type":"video","height":1080}},{{"index":1,"codec_type":"video","height":720}},{{"index":2,"codec_type":"video","height":480}},{{"index":3,"codec_type":"audio"}}]}}'
+        ;;
+      *)
+        printf '%s\n' '{{"streams":[{{"index":0,"codec_type":"video","height":1080}},{{"index":1,"codec_type":"video","height":720}},{{"index":2,"codec_type":"audio"}}]}}'
+        ;;
+    esac
     ;;
   *)
     case "{mode}" in

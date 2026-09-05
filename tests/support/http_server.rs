@@ -293,7 +293,18 @@ async fn handle_connection(
             )
             .await
         }
-        "/segment.m4s" | "/segment-$.m4s" => {
+        "/segment.m4s"
+        | "/segment-$.m4s"
+        | "/seg-v1-00001.m4s"
+        | "/init-v1.m4s"
+        | "/chunk-stream0-00001.m4s"
+        | "/init-stream0.m4s"
+        | "/chunk-stream1-00001.m4s"
+        | "/init-stream1.m4s"
+        | "/chunk-stream2-00001.m4s"
+        | "/init-stream2.m4s"
+        | "/chunk-stream3-00001.m4s"
+        | "/init-stream3.m4s" => {
             if state.segment_forbidden.load(Ordering::Relaxed) {
                 return write_response(
                     &mut stream,
@@ -332,19 +343,27 @@ async fn handle_connection(
                 )
                 .await
             } else {
-                write_response(
-                    &mut stream,
-                    "200 OK",
-                    &[
-                        ("accept-ranges", "bytes".to_string()),
-                        ("content-type", "video/iso.segment".to_string()),
-                        ("etag", FIXTURE_ETAG.to_string()),
-                        ("last-modified", FIXTURE_LAST_MODIFIED.to_string()),
-                        ("content-length", segment.len().to_string()),
-                    ],
-                    segment,
-                )
-                .await
+                let status = if request.path.starts_with("/init-stream")
+                    || request.path.starts_with("/chunk-stream")
+                {
+                    "206 Partial Content"
+                } else {
+                    "200 OK"
+                };
+                let mut headers = vec![
+                    ("accept-ranges", "bytes".to_string()),
+                    ("content-type", "video/iso.segment".to_string()),
+                    ("etag", FIXTURE_ETAG.to_string()),
+                    ("last-modified", FIXTURE_LAST_MODIFIED.to_string()),
+                    ("content-length", segment.len().to_string()),
+                ];
+                if status == "206 Partial Content" {
+                    headers.push((
+                        "content-range",
+                        format!("bytes 0-{}/{}", segment.len() - 1, segment.len()),
+                    ));
+                }
+                write_response(&mut stream, status, &headers, segment).await
             }
         }
         "/subtitle" => {
