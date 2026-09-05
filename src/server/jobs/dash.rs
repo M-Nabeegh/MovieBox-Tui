@@ -758,7 +758,7 @@ fn classify_proxy_failure(error: &NetSecurityError) -> ProxyFailure {
         NetSecurityError::RedirectLimitExceeded(_) => "redirect_limit_exceeded",
         NetSecurityError::Request(_) => "request",
     };
-    warn!(reason, "DASH proxy upstream request rejected");
+    warn!("DASH proxy upstream request rejected (reason={reason})");
     match error {
         NetSecurityError::Request(_) => ProxyFailure::Network,
         _ => ProxyFailure::Security,
