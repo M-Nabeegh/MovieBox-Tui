@@ -1226,50 +1226,17 @@ fn canonicalize_dash_reference(
 }
 
 fn decode_xml_entities(value: &str) -> Result<String, DashError> {
-    let mut output = String::with_capacity(value.len());
-    let mut cursor = 0;
-    while let Some(relative) = value[cursor..].find('&') {
-        let start = cursor + relative;
-        output.push_str(&value[cursor..start]);
-        let Some(end_offset) = value[start + 1..].find(';') else {
-            output.push('&');
-            cursor = start + 1;
-            continue;
-        };
-        let end = start + 1 + end_offset;
-        let entity = &value[start + 1..end];
-        let decoded = match entity {
-            "amp" => "&".to_string(),
-            "lt" => "<".to_string(),
-            "gt" => ">".to_string(),
-            "quot" => "\"".to_string(),
-            "apos" => "'".to_string(),
-            _ if entity
-                .strip_prefix("#x")
-                .or_else(|| entity.strip_prefix("#X"))
-                .is_some() =>
-            {
-                let digits = entity[2..].trim();
-                let code = u32::from_str_radix(digits, 16)
-                    .map_err(|_| DashError::UnsafeManifestReference)?;
-                char::from_u32(code)
-                    .ok_or(DashError::UnsafeManifestReference)?
-                    .to_string()
-            }
-            _ if entity.strip_prefix('#').is_some() => {
-                let code = entity[1..]
-                    .parse::<u32>()
-                    .map_err(|_| DashError::UnsafeManifestReference)?;
-                char::from_u32(code)
-                    .ok_or(DashError::UnsafeManifestReference)?
-                    .to_string()
-            }
-            _ => return Err(DashError::UnsafeManifestReference),
-        };
-        output.push_str(&decoded);
-        cursor = end + 1;
+    if !value.contains(';') {
+        if value.contains("<!") {
+            return Err(DashError::UnsafeManifestReference);
+        }
+        return Ok(value.to_string());
     }
-    output.push_str(&value[cursor..]);
+    let output = quick_xml::escape::unescape_with(value, |entity| {
+        quick_xml::escape::resolve_predefined_entity(entity)
+    })
+    .map_err(|_| DashError::UnsafeManifestReference)?
+    .into_owned();
     if output.contains("<!") {
         return Err(DashError::UnsafeManifestReference);
     }
