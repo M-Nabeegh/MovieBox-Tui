@@ -430,6 +430,9 @@ impl Drop for MonitorGuard {
 struct DashCapability {
     path_template: String,
     query_template: Option<String>,
+    route_path_template: String,
+    route_query_template: Option<String>,
+    representation_ids: Option<Vec<String>>,
     path_pattern: DashTemplate,
     query_pattern: Option<DashTemplate>,
 }
@@ -442,13 +445,14 @@ struct DashTemplate {
 #[derive(Clone, Debug)]
 enum DashTemplatePiece {
     Literal(String),
+    LiteralDollar,
     Variable {
         kind: DashVariable,
         width: Option<usize>,
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashVariable {
     Number,
     Time,
@@ -980,28 +984,45 @@ fn random_proxy_token() -> String {
 }
 
 impl DashCapability {
-    fn new(path_template: String, query_template: Option<String>) -> Result<Self, DashError> {
+    fn new(
+        path_template: String,
+        query_template: Option<String>,
+        representation_ids: Option<Vec<String>>,
+    ) -> Result<Self, DashError> {
         let path_pattern = DashTemplate::parse(&path_template)?;
         let query_pattern = query_template
             .as_deref()
             .map(DashTemplate::parse)
             .transpose()?;
+        if representation_ids.is_none()
+            && (path_pattern.contains(DashVariable::RepresentationId)
+                || query_pattern
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.contains(DashVariable::RepresentationId)))
+        {
+            return Err(DashError::InvalidManifest(
+                "RepresentationID requires a declared Representation",
+            ));
+        }
         Ok(Self {
             path_template: path_pattern.render(),
             query_template: query_pattern.as_ref().map(DashTemplate::render),
+            route_path_template: path_pattern.render_route(),
+            route_query_template: query_pattern.as_ref().map(DashTemplate::render_route),
+            representation_ids,
             path_pattern,
             query_pattern,
         })
     }
 
     fn matches(&self, path: &str, query: Option<&str>) -> bool {
-        self.path_pattern.matches(path, false)
+        self.path_pattern
+            .matches(path, false, self.representation_ids.as_deref())
             && match (&self.query_template, query) {
                 (None, None) => true,
-                (Some(_), Some(actual)) => self
-                    .query_pattern
-                    .as_ref()
-                    .is_some_and(|pattern| pattern.matches(actual, true)),
+                (Some(_), Some(actual)) => self.query_pattern.as_ref().is_some_and(|pattern| {
+                    pattern.matches(actual, true, self.representation_ids.as_deref())
+                }),
                 _ => false,
             }
     }
@@ -1010,7 +1031,7 @@ impl DashCapability {
 #[cfg(test)]
 fn template_matches(template: &str, value: &str) -> bool {
     DashTemplate::parse(template)
-        .map(|pattern| pattern.matches(value, false))
+        .map(|pattern| pattern.matches(value, false, None))
         .unwrap_or(false)
 }
 
@@ -1031,7 +1052,7 @@ impl DashTemplate {
                         template[literal_start..cursor].to_owned(),
                     ));
                 }
-                pieces.push(DashTemplatePiece::Literal("$".to_owned()));
+                pieces.push(DashTemplatePiece::LiteralDollar);
                 cursor += 2;
                 literal_start = cursor;
                 continue;
@@ -1074,6 +1095,7 @@ impl DashTemplate {
         for piece in &self.pieces {
             match piece {
                 DashTemplatePiece::Literal(value) => rendered.push_str(value),
+                DashTemplatePiece::LiteralDollar => rendered.push('$'),
                 DashTemplatePiece::Variable { kind, width } => {
                     rendered.push('$');
                     rendered.push_str(kind.name());
@@ -1087,7 +1109,32 @@ impl DashTemplate {
         rendered
     }
 
-    fn matches(&self, value: &str, query: bool) -> bool {
+    fn render_route(&self) -> String {
+        let mut rendered = String::new();
+        for piece in &self.pieces {
+            match piece {
+                DashTemplatePiece::Literal(value) => rendered.push_str(value),
+                DashTemplatePiece::LiteralDollar => rendered.push_str("$$"),
+                DashTemplatePiece::Variable { kind, width } => {
+                    rendered.push('$');
+                    rendered.push_str(kind.name());
+                    if let Some(width) = width {
+                        rendered.push_str(&format!("%0{width}d"));
+                    }
+                    rendered.push('$');
+                }
+            }
+        }
+        rendered
+    }
+
+    fn contains(&self, wanted: DashVariable) -> bool {
+        self.pieces.iter().any(
+            |piece| matches!(piece, DashTemplatePiece::Variable { kind, .. } if *kind == wanted),
+        )
+    }
+
+    fn matches(&self, value: &str, query: bool, representation_ids: Option<&[String]>) -> bool {
         let mut offset = 0;
         for (index, piece) in self.pieces.iter().enumerate() {
             match piece {
@@ -1096,6 +1143,12 @@ impl DashTemplate {
                         return false;
                     }
                     offset += literal.len();
+                }
+                DashTemplatePiece::LiteralDollar => {
+                    if !value[offset..].starts_with('$') {
+                        return false;
+                    }
+                    offset += '$'.len_utf8();
                 }
                 DashTemplatePiece::Variable { kind, width } => {
                     let next_literal = self.pieces[index + 1..].iter().find_map(|piece| {
@@ -1110,8 +1163,12 @@ impl DashTemplate {
                             value[offset..].find(literal).map(|index| offset + index)
                         })
                         .unwrap_or(value.len());
+                    let candidate = &value[offset..end];
                     if end < offset
-                        || !valid_dash_variable(*kind, *width, &value[offset..end], query)
+                        || !valid_dash_variable(*kind, *width, candidate, query)
+                        || (*kind == DashVariable::RepresentationId
+                            && representation_ids
+                                .is_some_and(|ids| !ids.iter().any(|id| id == candidate)))
                     {
                         return false;
                     }
@@ -1217,11 +1274,13 @@ fn parse_dash_manifest(
                         }
                     })
                     .unwrap_or_else(|| remote_url.clone());
+                let representation_id = representation_context(&start, &stack)?;
                 let (rewritten, is_base) = rewrite_manifest_start(
                     &start,
                     &parent_base,
                     remote_url,
                     token,
+                    representation_id.as_deref(),
                     &mut capabilities,
                 )?;
                 writer
@@ -1237,6 +1296,7 @@ fn parse_dash_manifest(
                     has_base_url: false,
                     is_base,
                     base_text: String::new(),
+                    representation_id,
                 });
             }
             Event::Empty(start) => {
@@ -1261,6 +1321,7 @@ fn parse_dash_manifest(
                         }
                     })
                     .unwrap_or_else(|| remote_url.clone());
+                let representation_id = representation_context(&start, &stack)?;
                 if name == "BaseURL" {
                     return Err(DashError::InvalidManifest("empty BaseURL"));
                 }
@@ -1269,6 +1330,7 @@ fn parse_dash_manifest(
                     &parent_base,
                     remote_url,
                     token,
+                    representation_id.as_deref(),
                     &mut capabilities,
                 )?;
                 writer
@@ -1325,14 +1387,20 @@ fn parse_dash_manifest(
                         &parent_base,
                         remote_url,
                         token,
+                        stack
+                            .last()
+                            .and_then(|element| element.representation_id.as_deref()),
                         &mut capabilities,
                     )?;
                     writer
                         .write_event(Event::Text(BytesText::new(&route)))
                         .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
-                    if let Some(parent) = stack.last_mut()
-                        && !parent.has_base_url
-                    {
+                    if let Some(parent) = stack.last_mut() {
+                        if parent.has_base_url {
+                            return Err(DashError::InvalidManifest(
+                                "multiple sibling BaseURL alternatives are unsupported",
+                            ));
+                        }
                         parent.base = target;
                         parent.has_base_url = true;
                     }
@@ -1374,6 +1442,42 @@ struct ManifestElement {
     has_base_url: bool,
     is_base: bool,
     base_text: String,
+    representation_id: Option<String>,
+}
+
+fn representation_context(
+    start: &BytesStart<'_>,
+    stack: &[ManifestElement],
+) -> Result<Option<String>, DashError> {
+    if xml_name(start.local_name().as_ref())? != "Representation" {
+        return Ok(stack
+            .last()
+            .and_then(|element| element.representation_id.clone()));
+    }
+    let mut id = None;
+    for attribute in start.attributes().with_checks(true) {
+        let attribute =
+            attribute.map_err(|_| DashError::InvalidManifest("malformed XML attribute"))?;
+        if xml_name(attribute.key.as_ref())? != "id" {
+            continue;
+        }
+        if id.is_some() {
+            return Err(DashError::InvalidManifest("duplicate Representation id"));
+        }
+        let value = attribute
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|_| DashError::UnsafeManifestReference)?
+            .into_owned();
+        let value = decode_xml_entities(&value)?;
+        if !valid_dash_variable(DashVariable::RepresentationId, None, &value, false) {
+            return Err(DashError::UnsafeManifestReference);
+        }
+        id = Some(value);
+    }
+    id.ok_or(DashError::InvalidManifest(
+        "Representation requires a declared id",
+    ))
+    .map(Some)
 }
 
 fn xml_name(name: &str) -> Result<&str, DashError> {
@@ -1389,6 +1493,7 @@ fn rewrite_manifest_start(
     base: &Url,
     remote_url: &Url,
     token: &str,
+    representation_id: Option<&str>,
     capabilities: &mut Vec<DashCapability>,
 ) -> Result<(BytesStart<'static>, bool), DashError> {
     let name = xml_name(start.name().as_ref())?.to_string();
@@ -1407,7 +1512,15 @@ fn rewrite_manifest_start(
             key.as_str(),
             "media" | "initialization" | "sourceURL" | "index"
         ) {
-            canonicalize_dash_reference(value.trim(), base, remote_url, token, capabilities)?.0
+            canonicalize_dash_reference(
+                value.trim(),
+                base,
+                remote_url,
+                token,
+                representation_id,
+                capabilities,
+            )?
+            .0
         } else {
             if !key.starts_with("xmlns") {
                 reject_external_text(&value)?;
@@ -1425,17 +1538,20 @@ fn canonicalize_dash_reference(
     base: &Url,
     remote_url: &Url,
     token: &str,
+    representation_id: Option<&str>,
     capabilities: &mut Vec<DashCapability>,
 ) -> Result<(String, Url), DashError> {
     let value = decode_xml_entities(value.trim())?;
     if value.is_empty() {
         return Ok((String::new(), base.clone()));
     }
+    let value_pattern = DashTemplate::parse(&value)?;
+    let canonical_value = value_pattern.render_route();
     if is_unsafe_scheme(&value) || value.starts_with("//") {
         return Err(DashError::UnsafeManifestReference);
     }
     let mut target = base
-        .join(&value)
+        .join(&canonical_value)
         .map_err(|_| DashError::UnsafeManifestReference)?;
     if !matches!(target.scheme(), "http" | "https") || target.origin() != remote_url.origin() {
         return Err(DashError::UnsafeManifestReference);
@@ -1449,17 +1565,22 @@ fn canonicalize_dash_reference(
         return Err(DashError::UnsafeManifestReference);
     }
     let query_template = target.query().map(str::to_owned);
-    let capability = DashCapability::new(path, query_template)?;
-    let route_path = capability.path_template.clone();
-    let route_query = capability.query_template.clone();
+    let capability = DashCapability::new(
+        path,
+        query_template,
+        representation_id.map(|value| vec![value.to_owned()]),
+    )?;
+    let route_path_template = capability.route_path_template.clone();
+    let route_query_template = capability.route_query_template.clone();
     if !capabilities.iter().any(|existing| {
         existing.path_template == capability.path_template
             && existing.query_template == capability.query_template
+            && existing.representation_ids == capability.representation_ids
     }) {
         capabilities.push(capability);
     }
-    let mut route = format!("/__dash/{token}{route_path}");
-    if let Some(query) = route_query {
+    let mut route = format!("/__dash/{token}{route_path_template}");
+    if let Some(query) = route_query_template {
         route.push('?');
         route.push_str(&query);
     }
@@ -1744,11 +1865,23 @@ mod tests {
             capability.path_template == "/path/media/seg-$Number$.m4s"
                 && capability.query_template.as_deref() == Some("x=1&y=$Time$")
         }));
+
+        let literal_dollar =
+            br#"<MPD><Period><SegmentTemplate media="segment-$$.m4s" /></Period></MPD>"#;
+        let literal = parse_dash_manifest(literal_dollar, &remote, "opaque-token").unwrap();
+        assert!(
+            literal
+                .bytes
+                .windows(b"segment-$$.m4s".len())
+                .any(|window| { window == b"segment-$$.m4s" })
+        );
+        assert!(literal.capabilities[0].matches("/path/segment-$.m4s", None));
     }
 
     #[test]
     fn capability_matching_requires_an_exact_opaque_token_route() {
-        let capability = DashCapability::new("/segments/$Number$.m4s".to_string(), None).unwrap();
+        let capability =
+            DashCapability::new("/segments/$Number$.m4s".to_string(), None, None).unwrap();
         assert!(capability.matches("/segments/3.m4s", None));
         assert!(!capability.matches("/segments/3.m4s", Some("x=1")));
     }
@@ -1808,6 +1941,27 @@ mod tests {
 
         let query_only = br#"<MPD><Period><BaseURL>?signed=fixture</BaseURL><SegmentTemplate media="segment.m4s" /></Period></MPD>"#;
         assert!(parse_dash_manifest(query_only, &remote, "opaque-token").is_ok());
+
+        let alternatives = br#"<MPD><Period><AdaptationSet><BaseURL>a/</BaseURL><BaseURL>b/</BaseURL><SegmentTemplate media="segment.m4s" /></AdaptationSet></Period></MPD>"#;
+        assert!(matches!(
+            parse_dash_manifest(alternatives, &remote, "opaque-token"),
+            Err(super::DashError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn representation_id_templates_are_bound_to_declared_representation_scope() {
+        let remote = Url::parse("https://cdn.example.invalid/index.mpd").unwrap();
+        let declared = br#"<MPD><Period><AdaptationSet><Representation id="video-a"><SegmentTemplate media="seg-$RepresentationID$.m4s" /></Representation></AdaptationSet></Period></MPD>"#;
+        let parsed = parse_dash_manifest(declared, &remote, "opaque-token").unwrap();
+        assert!(parsed.capabilities[0].matches("/seg-video-a.m4s", None));
+        assert!(!parsed.capabilities[0].matches("/seg-video-b.m4s", None));
+
+        let undeclared = br#"<MPD><Period><AdaptationSet><SegmentTemplate media="seg-$RepresentationID$.m4s" /></AdaptationSet></Period></MPD>"#;
+        assert!(parse_dash_manifest(undeclared, &remote, "opaque-token").is_err());
+
+        let unsafe_id = br#"<MPD><Period><AdaptationSet><Representation id="../video"><SegmentTemplate media="seg-$RepresentationID$.m4s" /></Representation></AdaptationSet></Period></MPD>"#;
+        assert!(parse_dash_manifest(unsafe_id, &remote, "opaque-token").is_err());
     }
 
     #[tokio::test]

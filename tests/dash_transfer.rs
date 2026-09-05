@@ -265,6 +265,36 @@ async fn dash_transfer_fetches_manifest_and_segments_through_the_guarded_proxy()
 }
 
 #[tokio::test]
+async fn dash_transfer_preserves_literal_dollar_escaping_for_ffmpeg_routes() {
+    let server =
+        FixtureServer::start_dash(dash_manifest_literal_dollar(), b"fixture-segment".to_vec())
+            .await
+            .unwrap();
+    let tools = fake_media_tools(tempdir().unwrap(), FakeMediaOutput::LiteralDollar);
+    let transfer = DashTransfer::with_tools(server.client(), &tools.ffmpeg, &tools.ffprobe);
+    let workspace = tempdir().unwrap();
+    let destination = workspace.path().join("literal-dollar.mkv");
+
+    let result = transfer
+        .transfer(
+            dash_request(server.url("/manifest.mpd")),
+            &destination,
+            CancellationToken::new(),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, DownloadOutcome::Completed { bytes: 13 });
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.path == "/segment-$.m4s")
+    );
+}
+
+#[tokio::test]
 async fn dash_transfer_maps_guarded_segment_403_to_an_auth_error_and_cleans_up() {
     let server = FixtureServer::start_dash(dash_manifest(), b"fixture-segment".to_vec())
         .await
@@ -466,6 +496,14 @@ fn dash_manifest() -> Vec<u8> {
         .to_vec()
 }
 
+fn dash_manifest_literal_dollar() -> Vec<u8> {
+    br#"<MPD><Period><AdaptationSet contentType="video">
+      <Representation id="720" height="720" />
+      <SegmentTemplate media="segment-$$.m4s" />
+    </AdaptationSet></Period></MPD>"#
+        .to_vec()
+}
+
 fn dash_request(url: Url) -> DownloadRequest {
     DownloadRequest {
         url,
@@ -481,6 +519,7 @@ fn dash_request(url: Url) -> DownloadRequest {
 #[derive(Clone, Copy)]
 enum FakeMediaOutput {
     FeatureLength,
+    LiteralDollar,
     NoVideo,
     Notice,
     Fail,
@@ -498,6 +537,7 @@ struct FakeMediaTools {
 fn fake_media_tools(temp: TempDir, output: FakeMediaOutput) -> FakeMediaTools {
     let mode = match output {
         FakeMediaOutput::FeatureLength => "feature",
+        FakeMediaOutput::LiteralDollar => "literal-dollar",
         FakeMediaOutput::NoVideo => "no-video",
         FakeMediaOutput::Notice => "notice",
         FakeMediaOutput::Fail => "fail",
@@ -533,7 +573,11 @@ case "$selected" in
 esac
 curl --fail --silent "$input" >/dev/null
 headers_file="${{output}}.headers"
-curl --fail --silent --range 0-2 -D "$headers_file" "${{input%/*}}/segment.m4s" >/dev/null
+segment="${{input%/*}}/segment.m4s"
+case "{mode}" in
+  literal-dollar) segment="${{input%/*}}/segment-\$.m4s" ;;
+esac
+curl --fail --silent --range 0-2 -D "$headers_file" "$segment" >/dev/null
 grep -q '206 Partial Content' "$headers_file"
 grep -qi 'content-range: bytes 0-2/' "$headers_file"
 grep -qi 'accept-ranges: bytes' "$headers_file"
@@ -544,6 +588,7 @@ case "{mode}" in
     curl --fail --silent --path-as-is "${{input%/*}}/../wrong-token/segment.m4s" >/dev/null || true
     printf 'fixture-media' > "$output"
     ;;
+  literal-dollar) printf 'fixture-media' > "$output" ;;
   feature) printf 'fixture-media' > "$output" ;;
   notice) dd if=/dev/zero of="$output" bs=917554 count=1 2>/dev/null ;;
   fail) exit 7 ;;

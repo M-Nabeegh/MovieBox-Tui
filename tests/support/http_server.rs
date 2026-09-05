@@ -293,7 +293,7 @@ async fn handle_connection(
             )
             .await
         }
-        "/segment.m4s" => {
+        "/segment.m4s" | "/segment-$.m4s" => {
             if state.segment_forbidden.load(Ordering::Relaxed) {
                 return write_response(
                     &mut stream,
