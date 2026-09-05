@@ -51,6 +51,7 @@ const WARNING_THROTTLE: Duration = Duration::from_secs(5 * 60);
 /// Signed catalog URLs expire on a timer, so a large download can outlive several
 /// of them. Each expiry costs one re-resolve rather than the whole transfer.
 const MAX_URL_REFRESHES: u8 = 5;
+const MAX_AUTH_REFRESHES: u8 = 1;
 
 #[derive(Debug, Clone, Default)]
 pub struct JobStatePatch {
@@ -628,7 +629,10 @@ where
         // page or promotional clip can be a perfectly complete HTTP response
         // with its own (much smaller) Content-Length; trusting that response
         // alone would publish the wrong video as a successful download.
-        let catalog_expected_size = resolved.expected_size.filter(|size| *size > 0);
+        let catalog_expected_size = resolved
+            .catalog_size_bytes
+            .or(resolved.expected_size)
+            .filter(|size| *size > 0);
         let download = self
             .download_with_refresh(downloading, resolved, cancel)
             .await?;
@@ -759,7 +763,8 @@ where
             fs::create_dir_all(parent).await?;
         }
 
-        let mut refreshes = 0_u8;
+        let mut url_refreshes = 0_u8;
+        let mut auth_refreshes = 0_u8;
         loop {
             let token = worker_cancel.child_token();
 
@@ -786,9 +791,9 @@ where
                 // The signed URL aged out mid-transfer. Re-sign it and continue
                 // from the bytes already on disk rather than starting over.
                 Err(TransferError::Download(DownloadError::Http(status)))
-                    if refreshes < MAX_URL_REFRESHES && is_expired_status(status) =>
+                    if auth_refreshes < MAX_AUTH_REFRESHES && is_auth_expired_status(status) =>
                 {
-                    refreshes += 1;
+                    auth_refreshes += 1;
                     resolved = match self
                         .catalog
                         .resolve(&downloading.source_id, downloading.subtitle_id.as_ref())
@@ -809,6 +814,55 @@ where
                             return Ok(None);
                         }
                     };
+                }
+                Err(TransferError::Download(DownloadError::Http(status)))
+                    if url_refreshes < MAX_URL_REFRESHES && is_url_expired_status(status) =>
+                {
+                    url_refreshes += 1;
+                    resolved = match self
+                        .catalog
+                        .resolve(&downloading.source_id, downloading.subtitle_id.as_ref())
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let current = self.store.get(downloading.id).await?;
+                            if current.state == JobState::Downloading {
+                                self.give_up_or_reschedule(
+                                    &current,
+                                    &error,
+                                    "download_failed",
+                                    "download request failed",
+                                )
+                                .await?;
+                            }
+                            return Ok(None);
+                        }
+                    };
+                }
+                Err(TransferError::Dash(super::dash::DashError::ProxySecurity)) => {
+                    let current = self.store.get(downloading.id).await?;
+                    if current.state == JobState::Downloading {
+                        self.fail_current_job(
+                            downloading.id,
+                            "download_failed",
+                            "unsafe DASH proxy request",
+                        )
+                        .await?;
+                    }
+                    return Ok(None);
+                }
+                Err(TransferError::Dash(super::dash::DashError::ProxyNetwork)) => {
+                    let current = self.store.get(downloading.id).await?;
+                    if current.state == JobState::Downloading {
+                        self.fail_current_job(
+                            downloading.id,
+                            "download_failed",
+                            "DASH proxy network failure",
+                        )
+                        .await?;
+                    }
+                    return Ok(None);
                 }
                 Err(error) => {
                     // The transfer layer already exhausted its own in-place
@@ -1212,11 +1266,12 @@ fn active_transfer_path(partial_relative: &str) -> Option<PathBuf> {
     partial_relative.strip_suffix(".part").map(PathBuf::from)
 }
 
-fn is_expired_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE
-    )
+fn is_auth_expired_status(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+fn is_url_expired_status(status: StatusCode) -> bool {
+    matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE)
 }
 
 fn map_repo_as_io(error: JobRepositoryError) -> TransferError {

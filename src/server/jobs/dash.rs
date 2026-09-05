@@ -6,24 +6,31 @@
 
 use std::{
     ffi::OsString,
-    net::IpAddr,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use quick_xml::{
+    Reader, Writer,
+    events::{BytesStart, BytesText, Event},
+};
+use rand::RngExt;
 use reqwest::{
     Method, StatusCode,
-    header::{HeaderMap, HeaderValue, RANGE},
+    header::{
+        ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue,
+        LAST_MODIFIED, RANGE,
+    },
 };
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::Command,
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    task::{JoinHandle, JoinSet},
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
@@ -32,7 +39,7 @@ use url::Url;
 use crate::{
     catalog::SourceTransport,
     download::{DownloadClient, DownloadError, DownloadOutcome, DownloadRequest},
-    server::security::net::follow_checked_redirects_same_origin,
+    server::security::net::{NetSecurityError, follow_checked_redirects_same_origin},
 };
 
 use super::worker::TransferProgress;
@@ -44,6 +51,7 @@ const NOTICE_DURATION_SECONDS: f64 = 20.97;
 const NOTICE_DURATION_TOLERANCE_SECONDS: f64 = 0.5;
 const NOTICE_SIZE_BYTES: u64 = 917_554;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+const DASH_PROXY_CONNECTIONS: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MediaProbe {
@@ -81,6 +89,10 @@ pub enum DashError {
     Io(#[from] std::io::Error),
     #[error("DASH transfer cancelled")]
     Cancelled,
+    #[error("DASH proxy rejected an unsafe upstream request")]
+    ProxySecurity,
+    #[error("DASH proxy encountered an upstream network failure")]
+    ProxyNetwork,
 }
 
 #[derive(Clone)]
@@ -148,11 +160,7 @@ impl DashTransfer {
             return Err(DashError::Download(DownloadError::Http(response.status())));
         }
         let remote_url = response.url().clone();
-        let manifest = response.bytes().await.map_err(DownloadError::from)?;
-        if manifest.len() > MAX_MANIFEST_BYTES {
-            return Err(DashError::InvalidManifest("manifest is too large"));
-        }
-        validate_manifest(&manifest)?;
+        let manifest = read_bounded_manifest(response, cancel.clone()).await?;
         let manifest_text =
             std::str::from_utf8(&manifest).map_err(|_| DashError::InvalidManifest("not UTF-8"))?;
         let representations = manifest_tag_chunks(manifest_text, "Representation");
@@ -168,130 +176,128 @@ impl DashTransfer {
             return Ok(DownloadOutcome::Paused { bytes: 0 });
         }
 
-        let proxy = DashProxy::start(
+        let mut proxy = DashProxy::start(
             self.client.clone(),
             manifest,
             remote_url,
             request.headers.clone(),
             request.maximum_redirects,
+            cancel.clone(),
         )
         .await?;
-        let selected_video_stream = match self
-            .probe_video_stream(&proxy.url, maximum_height, cancel.clone())
-            .await
-        {
-            Ok(index) => index,
-            Err(DashError::Cancelled) if cancel.is_cancelled() => {
+        let result = async {
+            let selected_video_stream = match self
+                .probe_video_stream(&proxy.url, maximum_height, cancel.clone())
+                .await
+            {
+                Ok(index) => index,
+                Err(DashError::Cancelled) if cancel.is_cancelled() => {
+                    return Ok(DownloadOutcome::Paused { bytes: 0 });
+                }
+                Err(error) => return Err(proxy_error_or(error, &proxy)),
+            };
+            if cancel.is_cancelled() {
                 return Ok(DownloadOutcome::Paused { bytes: 0 });
             }
-            Err(error) => {
-                if let Some(status) = proxy.auth_status() {
-                    return Err(DashError::Download(DownloadError::Http(status)));
+
+            let temporary = temporary_output_path(destination);
+            let _ = fs::remove_file(&temporary).await;
+            let args = private_ffmpeg_arguments(&proxy.url, selected_video_stream, &temporary);
+            let mut command = Command::new(&self.ffmpeg);
+            command
+                .kill_on_drop(true)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = command.spawn().map_err(DashError::Io)?;
+
+            let monitor_cancel = cancel.clone();
+            let monitor_output = temporary.clone();
+            let monitor_progress = progress.clone();
+            let monitor = MonitorGuard::new(tokio::spawn(async move {
+                loop {
+                    if monitor_cancel.is_cancelled() {
+                        break;
+                    }
+                    let bytes = fs::metadata(&monitor_output)
+                        .await
+                        .map(|metadata| metadata.len())
+                        .unwrap_or_default();
+                    let _ = monitor_progress.send(TransferProgress {
+                        downloaded_bytes: bytes,
+                        total_bytes: None,
+                        speed_bytes_per_second: None,
+                    });
+                    sleep(Duration::from_millis(250)).await;
                 }
+            }));
+
+            let status = tokio::select! {
+                status = child.wait() => status.map_err(DashError::Io)?,
+                _ = cancel.cancelled() => {
+                    let _ = child.kill().await;
+                    monitor.abort();
+                    let _ = fs::remove_file(&temporary).await;
+                    let _ = progress.send(TransferProgress {
+                        downloaded_bytes: 0,
+                        total_bytes: Some(0),
+                        speed_bytes_per_second: None,
+                    });
+                    return Ok(DownloadOutcome::Paused { bytes: 0 });
+                }
+            };
+            monitor.abort();
+            if !status.success() {
+                let _ = fs::remove_file(&temporary).await;
+                return Err(proxy_error_or(
+                    DashError::ToolFailed {
+                        tool: "ffmpeg",
+                        status: status.code(),
+                    },
+                    &proxy,
+                ));
+            }
+            if let Some(error) = proxy_error(&proxy) {
+                let _ = fs::remove_file(&temporary).await;
                 return Err(error);
             }
-        };
-        if cancel.is_cancelled() {
-            return Ok(DownloadOutcome::Paused { bytes: 0 });
-        }
 
-        let temporary = temporary_output_path(destination);
-        let _ = fs::remove_file(&temporary).await;
-        let args = private_ffmpeg_arguments(&proxy.url, selected_video_stream, &temporary);
-        let mut command = Command::new(&self.ffmpeg);
-        command
-            .kill_on_drop(true)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().map_err(DashError::Io)?;
-
-        let monitor_cancel = cancel.clone();
-        let monitor_output = temporary.clone();
-        let monitor_progress = progress.clone();
-        let monitor = MonitorGuard::new(tokio::spawn(async move {
-            loop {
-                if monitor_cancel.is_cancelled() {
-                    break;
+            let probe = match self.probe(&temporary, cancel.clone()).await {
+                Ok(probe) => probe,
+                Err(DashError::Cancelled) if cancel.is_cancelled() => {
+                    let _ = fs::remove_file(&temporary).await;
+                    return Ok(DownloadOutcome::Paused { bytes: 0 });
                 }
-                let bytes = fs::metadata(&monitor_output)
-                    .await
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-                let _ = monitor_progress.send(TransferProgress {
-                    downloaded_bytes: bytes,
-                    total_bytes: None,
-                    speed_bytes_per_second: None,
-                });
-                sleep(Duration::from_millis(250)).await;
-            }
-        }));
-
-        let status = tokio::select! {
-            status = child.wait() => status.map_err(DashError::Io)?,
-            _ = cancel.cancelled() => {
-                let _ = child.kill().await;
-                monitor.abort();
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary).await;
+                    return Err(proxy_error_or(error, &proxy));
+                }
+            };
+            if let Err(error) = validate_probe(probe, Some(expected_duration)) {
                 let _ = fs::remove_file(&temporary).await;
-                let _ = progress.send(TransferProgress {
-                    downloaded_bytes: 0,
-                    total_bytes: Some(0),
-                    speed_bytes_per_second: None,
-                });
+                return Err(error);
+            }
+            let bytes = fs::metadata(&temporary).await?.len();
+            if bytes == NOTICE_SIZE_BYTES {
+                let _ = fs::remove_file(&temporary).await;
+                return Err(DashError::NoticeMedia);
+            }
+            if cancel.is_cancelled() {
+                let _ = fs::remove_file(&temporary).await;
                 return Ok(DownloadOutcome::Paused { bytes: 0 });
             }
-        };
-        monitor.abort();
-        if !status.success() {
-            let _ = fs::remove_file(&temporary).await;
-            if let Some(status) = proxy.auth_status() {
-                return Err(DashError::Download(DownloadError::Http(status)));
-            }
-            return Err(DashError::ToolFailed {
-                tool: "ffmpeg",
-                status: status.code(),
+            fs::rename(&temporary, destination).await?;
+            let _ = progress.send(TransferProgress {
+                downloaded_bytes: bytes,
+                total_bytes: Some(bytes),
+                speed_bytes_per_second: None,
             });
+            Ok(DownloadOutcome::Completed { bytes })
         }
-        if let Some(status) = proxy.auth_status() {
-            let _ = fs::remove_file(&temporary).await;
-            return Err(DashError::Download(DownloadError::Http(status)));
-        }
-
-        let probe = match self.probe(&temporary, cancel.clone()).await {
-            Ok(probe) => probe,
-            Err(DashError::Cancelled) if cancel.is_cancelled() => {
-                let _ = fs::remove_file(&temporary).await;
-                return Ok(DownloadOutcome::Paused { bytes: 0 });
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temporary).await;
-                if let Some(status) = proxy.auth_status() {
-                    return Err(DashError::Download(DownloadError::Http(status)));
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = validate_probe(probe, Some(expected_duration)) {
-            let _ = fs::remove_file(&temporary).await;
-            return Err(error);
-        }
-        let bytes = fs::metadata(&temporary).await?.len();
-        if bytes == NOTICE_SIZE_BYTES {
-            let _ = fs::remove_file(&temporary).await;
-            return Err(DashError::NoticeMedia);
-        }
-        if cancel.is_cancelled() {
-            let _ = fs::remove_file(&temporary).await;
-            return Ok(DownloadOutcome::Paused { bytes: 0 });
-        }
-        fs::rename(&temporary, destination).await?;
-        let _ = progress.send(TransferProgress {
-            downloaded_bytes: bytes,
-            total_bytes: Some(bytes),
-            speed_bytes_per_second: None,
-        });
-        Ok(DownloadOutcome::Completed { bytes })
+        .await;
+        proxy.shutdown().await;
+        result
     }
 
     async fn probe_video_stream(
@@ -308,6 +314,8 @@ impl DashTransfer {
                 OsString::from("stream=index,codec_type,height"),
                 OsString::from("-of"),
                 OsString::from("json"),
+                OsString::from("-protocol_whitelist"),
+                OsString::from("http,tcp,tls,crypto"),
                 manifest_url.as_str().into(),
             ])
             .stdin(Stdio::null())
@@ -346,6 +354,8 @@ impl DashTransfer {
                 OsString::from("stream=codec_type:format=duration"),
                 OsString::from("-of"),
                 OsString::from("json"),
+                OsString::from("-protocol_whitelist"),
+                OsString::from("file"),
                 path.as_os_str().to_owned(),
             ])
             .stdin(Stdio::null())
@@ -394,22 +404,46 @@ impl Drop for MonitorGuard {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DashCapability {
+    path_template: String,
+    query_template: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedDashManifest {
+    bytes: Vec<u8>,
+    capabilities: Vec<DashCapability>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProxyFailure {
+    Auth(StatusCode),
+    Security,
+    Network,
+}
+
 #[derive(Clone)]
 struct DashProxyState {
     client: DownloadClient,
     manifest: Arc<Vec<u8>>,
-    manifest_directory: Url,
+    manifest_path: String,
+    token: String,
     origin: Url,
+    capabilities: Arc<Vec<DashCapability>>,
     headers: HeaderMap,
     maximum_redirects: u8,
-    auth_status: Arc<Mutex<Option<StatusCode>>>,
+    failure: Arc<Mutex<Option<ProxyFailure>>>,
+    cancel: CancellationToken,
+    connections: Arc<Semaphore>,
 }
 
 struct DashProxy {
     url: Url,
-    auth_status: Arc<Mutex<Option<StatusCode>>>,
+    failure: Arc<Mutex<Option<ProxyFailure>>>,
+    cancel: CancellationToken,
     shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl DashProxy {
@@ -419,63 +453,91 @@ impl DashProxy {
         remote_url: Url,
         headers: HeaderMap,
         maximum_redirects: u8,
+        cancel: CancellationToken,
     ) -> Result<Self, DashError> {
-        let rewritten = rewrite_manifest_for_proxy(&manifest, &remote_url)?;
+        let proxy_cancel = cancel.child_token();
+        let token = random_proxy_token();
+        let parsed = parse_dash_manifest(&manifest, &remote_url, &token)?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let mut origin = remote_url.clone();
         origin.set_path("/");
         origin.set_query(None);
         origin.set_fragment(None);
-        let manifest_directory = remote_url
-            .join("./")
-            .map_err(|_| DashError::InvalidManifest("manifest URL has no directory"))?;
-        let auth_status = Arc::new(Mutex::new(None));
+        let manifest_path = format!("/__dash/{token}/manifest.mpd");
+        let failure = Arc::new(Mutex::new(None));
         let state = DashProxyState {
             client,
-            manifest: Arc::new(rewritten),
-            manifest_directory,
+            manifest: Arc::new(parsed.bytes),
+            manifest_path: manifest_path.clone(),
+            token: token.clone(),
             origin,
+            capabilities: Arc::new(parsed.capabilities),
             headers,
             maximum_redirects,
-            auth_status: Arc::clone(&auth_status),
+            failure: Arc::clone(&failure),
+            cancel: proxy_cancel.clone(),
+            connections: Arc::new(Semaphore::new(DASH_PROXY_CONNECTIONS)),
         };
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let task_cancel = proxy_cancel.clone();
         let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = task_cancel.cancelled() => break,
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break; };
                         let state = state.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             let _ = serve_dash_proxy_connection(stream, state).await;
                         });
                     }
                 }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         });
-        let url = Url::parse(&format!("http://127.0.0.1:{}/manifest.mpd", address.port()))
-            .map_err(|_| DashError::InvalidManifest("proxy URL is invalid"))?;
+        let url = Url::parse(&format!(
+            "http://127.0.0.1:{}{}",
+            address.port(),
+            manifest_path
+        ))
+        .map_err(|_| DashError::InvalidManifest("proxy URL is invalid"))?;
         Ok(Self {
             url,
-            auth_status,
+            failure,
+            cancel: proxy_cancel,
             shutdown: Some(shutdown_tx),
-            task,
+            task: Some(task),
         })
     }
 
-    fn auth_status(&self) -> Option<StatusCode> {
-        self.auth_status.lock().ok().and_then(|status| *status)
+    async fn shutdown(&mut self) {
+        self.cancel.cancel();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+
+    fn failure(&self) -> Option<ProxyFailure> {
+        self.failure.lock().ok().and_then(|failure| *failure)
     }
 }
 
 impl Drop for DashProxy {
     fn drop(&mut self) {
+        self.cancel.cancel();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -483,13 +545,32 @@ async fn serve_dash_proxy_connection(
     mut stream: TcpStream,
     state: DashProxyState,
 ) -> Result<(), std::io::Error> {
+    let _permit = acquire_proxy_permit(&state).await?;
     let request = read_dash_proxy_request(&mut stream).await?;
     if request.method != Method::GET {
-        write_dash_proxy_response(&mut stream, StatusCode::METHOD_NOT_ALLOWED, &[]).await?;
+        write_dash_proxy_headers(
+            &mut stream,
+            StatusCode::METHOD_NOT_ALLOWED,
+            &HeaderMap::new(),
+            Some(0),
+        )
+        .await?;
         return Ok(());
     }
-    if request.target == "/manifest.mpd" {
-        write_dash_proxy_response(&mut stream, StatusCode::OK, &state.manifest).await?;
+    if request.target == state.manifest_path {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/dash+xml"),
+        );
+        write_dash_proxy_headers(
+            &mut stream,
+            StatusCode::OK,
+            &headers,
+            Some(state.manifest.len() as u64),
+        )
+        .await?;
+        stream.write_all(&state.manifest).await?;
         return Ok(());
     }
 
@@ -498,7 +579,14 @@ async fn serve_dash_proxy_connection(
     let upstream = match proxy_target_url(&state, &local_url) {
         Ok(upstream) => upstream,
         Err(_) => {
-            write_dash_proxy_response(&mut stream, StatusCode::BAD_REQUEST, &[]).await?;
+            record_proxy_failure(&state.failure, ProxyFailure::Security);
+            write_dash_proxy_headers(
+                &mut stream,
+                StatusCode::NOT_FOUND,
+                &HeaderMap::new(),
+                Some(0),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -508,38 +596,87 @@ async fn serve_dash_proxy_connection(
             headers.insert(RANGE, value);
         }
     }
-    let response = follow_checked_redirects_same_origin(
-        &state.client,
-        Method::GET,
-        upstream,
-        headers,
-        state.maximum_redirects,
-        state.origin.clone(),
-    )
-    .await;
+    let response = tokio::select! {
+        response = follow_checked_redirects_same_origin(
+            &state.client,
+            Method::GET,
+            upstream,
+            headers,
+            state.maximum_redirects,
+            state.origin.clone(),
+        ) => response,
+        _ = state.cancel.cancelled() => return Ok(()),
+    };
     match response {
-        Ok(response) => {
+        Ok(mut response) => {
             let status = response.status();
-            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-                && let Ok(mut auth_status) = state.auth_status.lock()
-            {
-                *auth_status = Some(status);
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                record_proxy_failure(&state.failure, ProxyFailure::Auth(status));
             }
-            let body = if status.is_success() {
-                response
-                    .bytes()
-                    .await
-                    .map_err(|error| std::io::Error::other(error.to_string()))?
-            } else {
-                Vec::new()
-            };
-            write_dash_proxy_response(&mut stream, status, &body).await?;
+            let response_headers = response.headers().clone();
+            let body_length = response.content_length();
+            write_dash_proxy_headers(&mut stream, status, &response_headers, body_length).await?;
+            if status.is_success() || status == StatusCode::PARTIAL_CONTENT {
+                loop {
+                    let chunk = tokio::select! {
+                        chunk = response.chunk() => chunk.map_err(|error| std::io::Error::other(error.to_string()))?,
+                        _ = state.cancel.cancelled() => return Ok(()),
+                    };
+                    let Some(chunk) = chunk else { break };
+                    stream.write_all(&chunk).await?;
+                }
+            }
         }
-        Err(_error) => {
-            write_dash_proxy_response(&mut stream, StatusCode::BAD_GATEWAY, &[]).await?;
+        Err(error) => {
+            record_proxy_failure(&state.failure, classify_proxy_failure(&error));
+            write_dash_proxy_headers(
+                &mut stream,
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                Some(0),
+            )
+            .await?;
         }
     }
     Ok(())
+}
+
+async fn acquire_proxy_permit(
+    state: &DashProxyState,
+) -> Result<OwnedSemaphorePermit, std::io::Error> {
+    state
+        .connections
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| std::io::Error::other("DASH proxy is shutting down"))
+}
+
+fn classify_proxy_failure(error: &NetSecurityError) -> ProxyFailure {
+    match error {
+        NetSecurityError::Request(_) => ProxyFailure::Network,
+        _ => ProxyFailure::Security,
+    }
+}
+
+fn record_proxy_failure(failure: &Arc<Mutex<Option<ProxyFailure>>>, next: ProxyFailure) {
+    if let Ok(mut current) = failure.lock() {
+        if current.is_none() {
+            *current = Some(next);
+        }
+    }
+}
+
+fn proxy_error(proxy: &DashProxy) -> Option<DashError> {
+    match proxy.failure()? {
+        ProxyFailure::Auth(status) => Some(DashError::Download(DownloadError::Http(status))),
+        ProxyFailure::Security => Some(DashError::ProxySecurity),
+        ProxyFailure::Network => Some(DashError::ProxyNetwork),
+    }
+}
+
+fn proxy_error_or(error: DashError, proxy: &DashProxy) -> DashError {
+    proxy_error(proxy).unwrap_or(error)
 }
 
 struct DashProxyRequest {
@@ -605,40 +742,76 @@ async fn read_dash_proxy_request(
     })
 }
 
-async fn write_dash_proxy_response(
+async fn write_dash_proxy_headers(
     stream: &mut TcpStream,
     status: StatusCode,
-    body: &[u8],
+    upstream_headers: &HeaderMap,
+    body_length: Option<u64>,
 ) -> Result<(), std::io::Error> {
     let reason = status.canonical_reason().unwrap_or("error");
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                status.as_u16(),
-                reason,
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .await?;
-    stream.write_all(body).await
+    let mut response = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason);
+    let selected = [
+        CONTENT_RANGE,
+        ACCEPT_RANGES,
+        CONTENT_TYPE,
+        ETAG,
+        LAST_MODIFIED,
+    ];
+    for name in selected {
+        if let Some(value) = upstream_headers
+            .get(&name)
+            .and_then(|value| value.to_str().ok())
+        {
+            response.push_str(name.as_str());
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+    }
+    if let Some(length) = body_length.or_else(|| {
+        upstream_headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()?.parse().ok())
+    }) {
+        response.push_str(&format!("Content-Length: {length}\r\n"));
+    }
+    response.push_str("Connection: close\r\n\r\n");
+    stream.write_all(response.as_bytes()).await
 }
 
 fn proxy_target_url(state: &DashProxyState, local_url: &Url) -> Result<Url, DashError> {
-    let path = local_url.path();
-    let mut upstream = if let Some(path) = path.strip_prefix("/__dash_origin/") {
-        state
-            .origin
-            .join(path)
-            .map_err(|_| DashError::UnsafeManifestReference)?
-    } else {
-        state
-            .manifest_directory
-            .join(path.trim_start_matches('/'))
-            .map_err(|_| DashError::UnsafeManifestReference)?
-    };
-    upstream.set_query(local_url.query());
+    let prefix = local_url
+        .path()
+        .strip_prefix("/__dash/")
+        .ok_or(DashError::UnsafeManifestReference)?;
+    let (token, path) = prefix
+        .split_once('/')
+        .ok_or(DashError::UnsafeManifestReference)?;
+    if token != state.token {
+        return Err(DashError::UnsafeManifestReference);
+    }
+    let path = format!("/{path}");
+    if path.split('/').any(|segment| {
+        segment == "."
+            || segment == ".."
+            || segment.eq_ignore_ascii_case("%2e")
+            || segment.eq_ignore_ascii_case("%2e%2e")
+    }) {
+        return Err(DashError::UnsafeManifestReference);
+    }
+    let query = local_url.query().map(str::to_owned);
+    if !state
+        .capabilities
+        .iter()
+        .any(|capability| capability.matches(&path, query.as_deref()))
+    {
+        return Err(DashError::UnsafeManifestReference);
+    }
+    let mut upstream = state
+        .origin
+        .join(path.trim_start_matches('/'))
+        .map_err(|_| DashError::UnsafeManifestReference)?;
+    upstream.set_query(query.as_deref());
     upstream.set_fragment(None);
     if upstream.origin() != state.origin.origin() {
         return Err(DashError::UnsafeManifestReference);
@@ -650,6 +823,36 @@ fn temporary_output_path(destination: &Path) -> PathBuf {
     let mut value = destination.as_os_str().to_os_string();
     value.push(".dash.tmp");
     PathBuf::from(value)
+}
+
+async fn read_bounded_manifest(
+    mut response: crate::server::security::net::DownloadResponse,
+    cancel: CancellationToken,
+) -> Result<Vec<u8>, DashError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MANIFEST_BYTES as u64)
+    {
+        return Err(DashError::InvalidManifest("manifest is too large"));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_MANIFEST_BYTES as u64) as usize,
+    );
+    loop {
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(DownloadError::from)?,
+            _ = cancel.cancelled() => return Err(DashError::Cancelled),
+        };
+        let Some(chunk) = chunk else { break };
+        if body.len().saturating_add(chunk.len()) > MAX_MANIFEST_BYTES {
+            return Err(DashError::InvalidManifest("manifest is too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Return the highest declared video representation not exceeding the limit.
@@ -667,206 +870,406 @@ pub fn choose_video_height(manifest: &str, maximum_height: u16) -> Option<u16> {
     selected
 }
 
-fn rewrite_manifest_for_proxy(bytes: &[u8], remote_url: &Url) -> Result<Vec<u8>, DashError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| DashError::InvalidManifest("not UTF-8"))?;
-    let mut rewritten = text.to_string();
-    for attribute_name in ["media", "initialization", "sourceURL"] {
-        rewritten = rewrite_dash_attribute(&rewritten, attribute_name, remote_url)?;
-    }
-    let mut cursor = 0;
-    while let Some(start) = rewritten[cursor..].find("<BaseURL>") {
-        let start = cursor + start + "<BaseURL>".len();
-        let Some(end) = rewritten[start..].find("</BaseURL>") else {
-            return Err(DashError::InvalidManifest("unterminated BaseURL"));
-        };
-        let end = start + end;
-        let value = rewritten[start..end].trim();
-        let replacement = rewrite_dash_reference(value, remote_url)?;
-        rewritten.replace_range(start..end, &replacement);
-        cursor = start + replacement.len();
-    }
-    if rewritten
-        .split(|character: char| {
-            character.is_ascii_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | '=')
-        })
-        .any(|token| token.contains("://") || token.starts_with("//"))
-    {
-        return Err(DashError::UnsafeManifestReference);
-    }
-    Ok(rewritten.into_bytes())
+fn random_proxy_token() -> String {
+    let mut bytes = [0_u8; 24];
+    rand::rng().fill(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn rewrite_dash_attribute(
-    text: &str,
-    attribute_name: &str,
-    remote_url: &Url,
-) -> Result<String, DashError> {
-    let mut output = String::with_capacity(text.len());
+impl DashCapability {
+    fn matches(&self, path: &str, query: Option<&str>) -> bool {
+        template_matches(&self.path_template, path)
+            && match (&self.query_template, query) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => template_matches(expected, actual),
+                _ => false,
+            }
+    }
+}
+
+fn template_matches(template: &str, value: &str) -> bool {
+    let mut literals = Vec::<(&str, bool)>::new();
     let mut cursor = 0;
-    while cursor < text.len() {
-        let Some(found) = text[cursor..].find(attribute_name) else {
+    while cursor < template.len() {
+        let Some(start_offset) = template[cursor..].find('$') else {
+            literals.push((&template[cursor..], false));
             break;
         };
-        let start = cursor + found;
-        let previous = start
-            .checked_sub(1)
-            .and_then(|index| text.as_bytes().get(index));
-        if previous.is_some_and(|byte| is_xml_name_byte(*byte)) {
-            cursor = start + attribute_name.len();
-            continue;
-        }
-        let mut equals = start + attribute_name.len();
-        while text
-            .as_bytes()
-            .get(equals)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            equals += 1;
-        }
-        if text.as_bytes().get(equals) != Some(&b'=') {
-            cursor = start + attribute_name.len();
-            continue;
-        }
-        equals += 1;
-        while text
-            .as_bytes()
-            .get(equals)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            equals += 1;
-        }
-        let Some(&quote) = text.as_bytes().get(equals) else {
-            return Err(DashError::InvalidManifest("unterminated DASH attribute"));
+        let start = cursor + start_offset;
+        literals.push((&template[cursor..start], false));
+        let Some(end_offset) = template[start + 1..].find('$') else {
+            return false;
         };
-        if !matches!(quote, b'"' | b'\'') {
-            return Err(DashError::InvalidManifest(
-                "DASH attribute value must be quoted",
-            ));
-        }
-        let value_start = equals + 1;
-        let Some(value_end_offset) = text[value_start..].find(char::from(quote)) else {
-            return Err(DashError::InvalidManifest("unterminated DASH attribute"));
-        };
-        let value_end = value_start + value_end_offset;
-        output.push_str(&text[cursor..value_start]);
-        output.push_str(&rewrite_dash_reference(
-            &text[value_start..value_end],
-            remote_url,
-        )?);
-        cursor = value_end;
+        cursor = start + 1 + end_offset + 1;
+        literals.push(("", true));
     }
-    output.push_str(&text[cursor..]);
+    if literals.is_empty() {
+        return value.is_empty();
+    }
+    let mut remainder = value;
+    let mut wildcard_seen = false;
+    for (literal, wildcard) in literals {
+        if wildcard {
+            wildcard_seen = true;
+            continue;
+        }
+        if literal.is_empty() {
+            continue;
+        }
+        if !wildcard_seen && !remainder.starts_with(literal) {
+            return false;
+        }
+        if let Some(index) = if wildcard_seen {
+            remainder.find(literal)
+        } else {
+            Some(0)
+        } {
+            remainder = &remainder[index + literal.len()..];
+        } else {
+            return false;
+        }
+    }
+    let ends_with_wildcard = template.ends_with('$');
+    ends_with_wildcard || remainder.is_empty()
+}
+
+fn parse_dash_manifest(
+    bytes: &[u8],
+    remote_url: &Url,
+    token: &str,
+) -> Result<ParsedDashManifest, DashError> {
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(DashError::InvalidManifest("manifest is too large"));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| DashError::InvalidManifest("not UTF-8"))?;
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("<!") || lowered.contains("doctype") {
+        return Err(DashError::UnsafeManifestReference);
+    }
+
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(false);
+    reader.config_mut().check_end_names = true;
+    let mut writer = Writer::new(Vec::with_capacity(bytes.len()));
+    let mut stack = Vec::<ManifestElement>::new();
+    let mut capabilities = Vec::new();
+    let mut root_seen = false;
+    let mut root_closed = false;
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|_| DashError::InvalidManifest("malformed XML"))?;
+        match event {
+            Event::Start(start) => {
+                let name = xml_name(start.name().as_ref())?.to_string();
+                if root_closed || (stack.is_empty() && root_seen) {
+                    return Err(DashError::InvalidManifest("multiple XML roots"));
+                }
+                if stack.is_empty() {
+                    if name != "MPD" {
+                        return Err(DashError::InvalidManifest("missing MPD root"));
+                    }
+                    root_seen = true;
+                }
+                let parent_base = stack
+                    .last()
+                    .map(|element| element.base.clone())
+                    .unwrap_or_else(|| remote_url.clone());
+                let (rewritten, is_base) = rewrite_manifest_start(
+                    &start,
+                    &parent_base,
+                    remote_url,
+                    token,
+                    &mut capabilities,
+                )?;
+                writer
+                    .write_event(Event::Start(rewritten))
+                    .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
+                stack.push(ManifestElement {
+                    name: name.to_string(),
+                    base: parent_base,
+                    is_base,
+                    base_text: String::new(),
+                });
+            }
+            Event::Empty(start) => {
+                let name = xml_name(start.name().as_ref())?.to_string();
+                if stack.is_empty() && root_seen {
+                    return Err(DashError::InvalidManifest("multiple XML roots"));
+                }
+                if stack.is_empty() {
+                    if name != "MPD" {
+                        return Err(DashError::InvalidManifest("missing MPD root"));
+                    }
+                    root_seen = true;
+                    root_closed = true;
+                }
+                let parent_base = stack
+                    .last()
+                    .map(|element| element.base.clone())
+                    .unwrap_or_else(|| remote_url.clone());
+                if name == "BaseURL" {
+                    return Err(DashError::InvalidManifest("empty BaseURL"));
+                }
+                let (rewritten, _) = rewrite_manifest_start(
+                    &start,
+                    &parent_base,
+                    remote_url,
+                    token,
+                    &mut capabilities,
+                )?;
+                writer
+                    .write_event(Event::Empty(rewritten))
+                    .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
+            }
+            Event::Text(text_event) => {
+                let text_value = text_event.as_ref();
+                if let Some(element) = stack.last_mut()
+                    && element.is_base
+                {
+                    element
+                        .base_text
+                        .push_str(&decode_xml_entities(text_value)?);
+                } else {
+                    reject_external_text(&decode_xml_entities(text_value)?)?;
+                    writer
+                        .write_event(Event::Text(text_event))
+                        .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
+                }
+            }
+            Event::GeneralRef(reference) => {
+                let value = decode_xml_entities(&format!("&{};", reference.as_ref()))?;
+                if let Some(element) = stack.last_mut()
+                    && element.is_base
+                {
+                    element.base_text.push_str(&value);
+                } else {
+                    return Err(DashError::UnsafeManifestReference);
+                }
+            }
+            Event::End(end) => {
+                let name = xml_name(end.name().as_ref())?.to_string();
+                let Some(element) = stack.pop() else {
+                    return Err(DashError::InvalidManifest("unbalanced XML"));
+                };
+                if element.name != name {
+                    return Err(DashError::InvalidManifest("unbalanced XML"));
+                }
+                if element.is_base {
+                    let parent_base = stack
+                        .last()
+                        .map(|parent| parent.base.clone())
+                        .unwrap_or_else(|| remote_url.clone());
+                    let value = element.base_text.trim();
+                    let (route, target) = canonicalize_dash_reference(
+                        value,
+                        &parent_base,
+                        remote_url,
+                        token,
+                        &mut capabilities,
+                    )?;
+                    writer
+                        .write_event(Event::Text(BytesText::new(&route)))
+                        .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
+                    if let Some(parent) = stack.last_mut() {
+                        parent.base = target;
+                    }
+                }
+                writer
+                    .write_event(Event::End(end))
+                    .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
+                if stack.is_empty() {
+                    root_closed = true;
+                }
+            }
+            Event::Decl(decl) => {
+                writer
+                    .write_event(Event::Decl(decl))
+                    .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
+            }
+            Event::Comment(_) | Event::CData(_) | Event::PI(_) | Event::DocType(_) => {
+                return Err(DashError::UnsafeManifestReference);
+            }
+            Event::Eof => {
+                if !root_seen || !root_closed || !stack.is_empty() {
+                    return Err(DashError::InvalidManifest("missing MPD root"));
+                }
+                break;
+            }
+        }
+    }
+    Ok(ParsedDashManifest {
+        bytes: writer.into_inner(),
+        capabilities,
+    })
+}
+
+#[derive(Debug)]
+struct ManifestElement {
+    name: String,
+    base: Url,
+    is_base: bool,
+    base_text: String,
+}
+
+fn xml_name(name: &str) -> Result<&str, DashError> {
+    if name.is_empty() {
+        Err(DashError::InvalidManifest("invalid XML name"))
+    } else {
+        Ok(name)
+    }
+}
+
+fn rewrite_manifest_start(
+    start: &BytesStart<'_>,
+    base: &Url,
+    remote_url: &Url,
+    token: &str,
+    capabilities: &mut Vec<DashCapability>,
+) -> Result<(BytesStart<'static>, bool), DashError> {
+    let name = xml_name(start.name().as_ref())?.to_string();
+    let is_base = xml_name(start.local_name().as_ref())? == "BaseURL";
+    let mut output = BytesStart::new(name);
+    for attribute in start.attributes().with_checks(true) {
+        let attribute =
+            attribute.map_err(|_| DashError::InvalidManifest("malformed XML attribute"))?;
+        let key = xml_name(attribute.key.as_ref())?.to_string();
+        let value = attribute
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|_| DashError::UnsafeManifestReference)?
+            .into_owned();
+        let value = decode_xml_entities(&value)?;
+        let rewritten = if matches!(
+            key.as_str(),
+            "media" | "initialization" | "sourceURL" | "index"
+        ) {
+            canonicalize_dash_reference(value.trim(), base, remote_url, token, capabilities)?.0
+        } else {
+            if !key.starts_with("xmlns") {
+                reject_external_text(&value)?;
+            }
+            value
+        };
+        let escaped = quick_xml::escape::escape(&rewritten).into_owned();
+        output.push_attribute((key.as_str(), escaped.as_str()));
+    }
+    Ok((output, is_base))
+}
+
+fn canonicalize_dash_reference(
+    value: &str,
+    base: &Url,
+    remote_url: &Url,
+    token: &str,
+    capabilities: &mut Vec<DashCapability>,
+) -> Result<(String, Url), DashError> {
+    let value = decode_xml_entities(value.trim())?;
+    if value.is_empty() {
+        return Ok((String::new(), base.clone()));
+    }
+    if is_unsafe_scheme(&value) || value.starts_with("//") {
+        return Err(DashError::UnsafeManifestReference);
+    }
+    let mut target = base
+        .join(&value)
+        .map_err(|_| DashError::UnsafeManifestReference)?;
+    if !matches!(target.scheme(), "http" | "https") || target.origin() != remote_url.origin() {
+        return Err(DashError::UnsafeManifestReference);
+    }
+    target.set_fragment(None);
+    let path = target.path().to_string();
+    if path.to_ascii_lowercase().ends_with(".mpd") {
+        return Err(DashError::UnsafeManifestReference);
+    }
+    let query_template = target.query().map(str::to_owned);
+    let capability = DashCapability {
+        path_template: path.clone(),
+        query_template: query_template.clone(),
+    };
+    if !capabilities.iter().any(|existing| {
+        existing.path_template == capability.path_template
+            && existing.query_template == capability.query_template
+    }) {
+        capabilities.push(capability);
+    }
+    let mut route = format!("/__dash/{token}{path}");
+    if let Some(query) = query_template {
+        route.push('?');
+        route.push_str(&query);
+    }
+    Ok((route, target))
+}
+
+fn decode_xml_entities(value: &str) -> Result<String, DashError> {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(relative) = value[cursor..].find('&') {
+        let start = cursor + relative;
+        output.push_str(&value[cursor..start]);
+        let Some(end_offset) = value[start + 1..].find(';') else {
+            output.push('&');
+            cursor = start + 1;
+            continue;
+        };
+        let end = start + 1 + end_offset;
+        let entity = &value[start + 1..end];
+        let decoded = match entity {
+            "amp" => "&".to_string(),
+            "lt" => "<".to_string(),
+            "gt" => ">".to_string(),
+            "quot" => "\"".to_string(),
+            "apos" => "'".to_string(),
+            _ if entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .is_some() =>
+            {
+                let digits = entity[2..].trim();
+                let code = u32::from_str_radix(digits, 16)
+                    .map_err(|_| DashError::UnsafeManifestReference)?;
+                char::from_u32(code)
+                    .ok_or(DashError::UnsafeManifestReference)?
+                    .to_string()
+            }
+            _ if entity.strip_prefix('#').is_some() => {
+                let code = entity[1..]
+                    .parse::<u32>()
+                    .map_err(|_| DashError::UnsafeManifestReference)?;
+                char::from_u32(code)
+                    .ok_or(DashError::UnsafeManifestReference)?
+                    .to_string()
+            }
+            _ => return Err(DashError::UnsafeManifestReference),
+        };
+        output.push_str(&decoded);
+        cursor = end + 1;
+    }
+    output.push_str(&value[cursor..]);
+    if output.contains("<!") {
+        return Err(DashError::UnsafeManifestReference);
+    }
     Ok(output)
 }
 
-fn is_xml_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':')
-}
-
-fn rewrite_dash_reference(value: &str, remote_url: &Url) -> Result<String, DashError> {
+fn reject_external_text(value: &str) -> Result<(), DashError> {
     let value = value.trim();
-    if value.is_empty() {
-        return Ok(value.to_string());
-    }
-    if is_unsafe_scheme(value) {
-        return Err(DashError::UnsafeManifestReference);
-    }
-    let Some(parsed) = parse_absolute_dash_url(value, remote_url) else {
-        return Ok(value.to_string());
-    };
-    if parsed.origin() != remote_url.origin() {
-        return Err(DashError::UnsafeManifestReference);
-    }
-    let mut local = format!("/__dash_origin{}", parsed.path());
-    if let Some(query) = parsed.query() {
-        local.push('?');
-        local.push_str(query);
-    }
-    Ok(local)
-}
-
-fn parse_absolute_dash_url(value: &str, remote_url: &Url) -> Option<Url> {
-    if value.starts_with("//") {
-        Url::parse(&format!("{}:{value}", remote_url.scheme())).ok()
-    } else if value.starts_with("http://") || value.starts_with("https://") {
-        Url::parse(value).ok()
-    } else {
-        None
-    }
-}
-
-/// Validate the fetched manifest before handing it to FFmpeg.
-pub fn validate_manifest(bytes: &[u8]) -> Result<(), DashError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| DashError::InvalidManifest("not UTF-8"))?;
-    if !text.contains("<MPD") || !text.contains("</MPD>") {
-        return Err(DashError::InvalidManifest("missing MPD root"));
-    }
-    for token in text.split(|character: char| {
-        character.is_ascii_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | '=')
-    }) {
-        if is_unsafe_scheme(token)
-            || (token.contains("://") && is_unsafe_reference(token))
-            || (token.starts_with("//") && is_unsafe_reference(token))
-        {
+    if value.is_empty() || is_unsafe_scheme(value) {
+        if is_unsafe_scheme(value) {
             return Err(DashError::UnsafeManifestReference);
         }
+        return Ok(());
     }
-    for tag in manifest_tag_chunks(text, "BaseURL") {
-        let value = tag.trim();
-        if is_unsafe_scheme(value)
-            || (value.contains("://") && is_unsafe_reference(value))
-            || (value.starts_with("//") && is_unsafe_reference(value))
-        {
-            return Err(DashError::UnsafeManifestReference);
-        }
-    }
-    for key in ["media", "initialization", "sourceURL"] {
-        for tag in manifest_tag_chunks(text, "") {
-            if let Some(value) = attribute(tag, key)
-                && (is_unsafe_scheme(value)
-                    || (value.contains("://") && is_unsafe_reference(value))
-                    || (value.starts_with("//") && is_unsafe_reference(value)))
-            {
-                return Err(DashError::UnsafeManifestReference);
-            }
-        }
+    if value.starts_with("//") || value.contains("://") {
+        return Err(DashError::UnsafeManifestReference);
     }
     Ok(())
 }
 
-fn is_unsafe_reference(value: &str) -> bool {
-    let value = value.trim();
-    let parse_value = if value.starts_with("//") {
-        format!("https:{value}")
-    } else {
-        value.to_string()
-    };
-    let Ok(url) = Url::parse(&parse_value) else {
-        return true;
-    };
-    if !matches!(url.scheme(), "http" | "https") {
-        return true;
-    }
-    let Some(host) = url.host_str() else {
-        return true;
-    };
-    if host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-    {
-        return true;
-    }
-    host.parse::<IpAddr>().is_ok_and(|address| {
-        address.is_loopback()
-            || address.is_unspecified()
-            || match address {
-                IpAddr::V4(address) => address.is_private() || address.is_link_local(),
-                IpAddr::V6(address) => {
-                    let first = address.segments()[0];
-                    (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-                }
-            }
-    })
+/// Validate the fetched manifest before handing it to FFmpeg.
+pub fn validate_manifest(bytes: &[u8]) -> Result<(), DashError> {
+    let placeholder = Url::parse("https://manifest.invalid/index.mpd")
+        .map_err(|_| DashError::InvalidManifest("invalid parser origin"))?;
+    parse_dash_manifest(bytes, &placeholder, "validation").map(|_| ())
 }
 
 fn is_unsafe_scheme(value: &str) -> bool {
@@ -1053,4 +1456,49 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let rest = &tag[start..];
     let end = rest.find('"')?;
     Some(&rest[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DashCapability, parse_dash_manifest, template_matches};
+    use url::Url;
+
+    #[test]
+    fn capability_templates_preserve_dash_variables_and_query_strings() {
+        assert!(template_matches(
+            "/segments/$Number$.m4s",
+            "/segments/17.m4s"
+        ));
+        assert!(template_matches("a=$Time$&b=fixture", "a=900&b=fixture"));
+        assert!(!template_matches("/segments/$Number$.m4s", "/other/17.m4s"));
+        let manifest = br#"<MPD><Period><BaseURL>media/</BaseURL><AdaptationSet><SegmentTemplate media="seg-$Number$.m4s?x=1&amp;y=$Time$" /></AdaptationSet></Period></MPD>"#;
+        let remote = Url::parse("https://cdn.example.invalid/path/index.mpd").unwrap();
+        let parsed = parse_dash_manifest(manifest, &remote, "opaque-token").unwrap();
+        assert!(
+            parsed
+                .bytes
+                .windows(b"/__dash/opaque-token/path/media/seg-".len())
+                .any(|window| window == b"/__dash/opaque-token/path/media/seg-")
+        );
+        assert!(
+            parsed
+                .bytes
+                .windows(b"&amp;".len())
+                .any(|window| window == b"&amp;")
+        );
+        assert!(parsed.capabilities.iter().any(|capability| {
+            capability.path_template == "/path/media/seg-$Number$.m4s"
+                && capability.query_template.as_deref() == Some("x=1&y=$Time$")
+        }));
+    }
+
+    #[test]
+    fn capability_matching_requires_an_exact_opaque_token_route() {
+        let capability = DashCapability {
+            path_template: "/segments/$Number$.m4s".to_string(),
+            query_template: None,
+        };
+        assert!(capability.matches("/segments/3.m4s", None));
+        assert!(!capability.matches("/segments/3.m4s", Some("x=1")));
+    }
 }

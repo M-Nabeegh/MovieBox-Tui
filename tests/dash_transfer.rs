@@ -56,6 +56,27 @@ fn dash_manifest_rejects_non_mpd_and_local_protocol_references() {
 }
 
 #[test]
+fn dash_manifest_rejects_entity_encoded_unsafe_references() {
+    assert!(matches!(
+        validate_manifest(br#"<MPD><BaseURL>&#x66;ile:///etc/passwd</BaseURL></MPD>"#),
+        Err(DashError::UnsafeManifestReference)
+    ));
+}
+
+#[test]
+fn dash_manifest_rejects_dtd_and_entity_declarations() {
+    for manifest in [
+        br#"<!DOCTYPE MPD SYSTEM "evil.dtd"><MPD></MPD>"#.as_slice(),
+        br#"<!ENTITY x "file:///etc/passwd"><MPD><BaseURL>&x;</BaseURL></MPD>"#,
+    ] {
+        assert!(matches!(
+            validate_manifest(manifest),
+            Err(DashError::UnsafeManifestReference)
+        ));
+    }
+}
+
+#[test]
 fn dash_ffmpeg_arguments_use_stream_copy_and_do_not_render_secret_headers() {
     let mut headers = HeaderMap::new();
     headers.insert("cookie", HeaderValue::from_static("CloudFront-Policy=fake"));
@@ -270,6 +291,32 @@ async fn dash_transfer_maps_guarded_segment_403_to_an_auth_error_and_cleans_up()
 }
 
 #[tokio::test]
+async fn dash_transfer_rejects_an_unadvertised_proxy_path_fail_closed() {
+    let server = FixtureServer::start_dash(dash_manifest(), b"fixture-segment".to_vec())
+        .await
+        .unwrap();
+    let tools = fake_media_tools(tempdir().unwrap(), FakeMediaOutput::UnauthorizedPath);
+    let transfer = DashTransfer::with_tools(server.client(), &tools.ffmpeg, &tools.ffprobe);
+    let workspace = tempdir().unwrap();
+    let error = transfer
+        .transfer(
+            dash_request(server.url("/manifest.mpd")),
+            &workspace.path().join("blocked.mkv"),
+            CancellationToken::new(),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DashError::ProxySecurity));
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.path != "/unadvertised.m4s")
+    );
+}
+
+#[tokio::test]
 async fn dash_transfer_maps_an_initial_manifest_401_to_an_auth_error() {
     let server = FixtureServer::start_dash(dash_manifest(), b"fixture-segment".to_vec())
         .await
@@ -432,6 +479,7 @@ enum FakeMediaOutput {
     Notice,
     Fail,
     Sleep,
+    UnauthorizedPath,
 }
 
 struct FakeMediaTools {
@@ -448,6 +496,7 @@ fn fake_media_tools(temp: TempDir, output: FakeMediaOutput) -> FakeMediaTools {
         FakeMediaOutput::Notice => "notice",
         FakeMediaOutput::Fail => "fail",
         FakeMediaOutput::Sleep => "sleep",
+        FakeMediaOutput::UnauthorizedPath => "unauthorized-path",
     };
     let ffmpeg = temp.path().join("ffmpeg");
     let ffprobe = temp.path().join("ffprobe");
@@ -477,8 +526,17 @@ case "$selected" in
   *) exit 91 ;;
 esac
 curl --fail --silent "$input" >/dev/null
-curl --fail --silent "${{input%/*}}/segment.m4s" >/dev/null
+headers_file="${{output}}.headers"
+curl --fail --silent --range 0-2 -D "$headers_file" "${{input%/*}}/segment.m4s" >/dev/null
+grep -q '206 Partial Content' "$headers_file"
+grep -qi 'content-range: bytes 0-2/' "$headers_file"
+grep -qi 'accept-ranges: bytes' "$headers_file"
+grep -qi 'content-type: video/iso.segment' "$headers_file"
 case "{mode}" in
+  unauthorized-path)
+    if curl --fail --silent "${{input%/*}}/unadvertised.m4s" >/dev/null; then exit 88; fi
+    printf 'fixture-media' > "$output"
+    ;;
   feature) printf 'fixture-media' > "$output" ;;
   notice) dd if=/dev/zero of="$output" bs=917554 count=1 2>/dev/null ;;
   fail) exit 7 ;;
@@ -495,9 +553,16 @@ esac
             r#"#!/bin/sh
 set -eu
 last=""
-for argument in "$@"; do last="$argument"; done
+protocol=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "-protocol_whitelist" ]; then protocol="$argument"; fi
+  previous="$argument"
+  last="$argument"
+done
 case "$last" in
   http://127.0.0.1:*/manifest.mpd)
+    [ "$protocol" = "http,tcp,tls,crypto" ] || exit 93
     printf '%s\n' '{{"streams":[{{"index":0,"codec_type":"video","height":1080}},{{"index":1,"codec_type":"video","height":720}},{{"index":2,"codec_type":"audio"}}]}}'
     ;;
   *)

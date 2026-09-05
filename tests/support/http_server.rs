@@ -312,13 +312,40 @@ async fn handle_connection(
                 )
                 .await;
             };
-            write_response(
-                &mut stream,
-                "200 OK",
-                &[("content-length", segment.len().to_string())],
-                segment,
-            )
-            .await
+            if let Some(range) = request.header("range") {
+                let (start, end) = parse_range(range, segment.len())?;
+                write_response(
+                    &mut stream,
+                    "206 Partial Content",
+                    &[
+                        ("accept-ranges", "bytes".to_string()),
+                        (
+                            "content-range",
+                            format!("bytes {start}-{end}/{}", segment.len()),
+                        ),
+                        ("content-type", "video/iso.segment".to_string()),
+                        ("etag", FIXTURE_ETAG.to_string()),
+                        ("last-modified", FIXTURE_LAST_MODIFIED.to_string()),
+                        ("content-length", (end - start + 1).to_string()),
+                    ],
+                    &segment[start..=end],
+                )
+                .await
+            } else {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    &[
+                        ("accept-ranges", "bytes".to_string()),
+                        ("content-type", "video/iso.segment".to_string()),
+                        ("etag", FIXTURE_ETAG.to_string()),
+                        ("last-modified", FIXTURE_LAST_MODIFIED.to_string()),
+                        ("content-length", segment.len().to_string()),
+                    ],
+                    segment,
+                )
+                .await
+            }
         }
         "/subtitle" => {
             write_response(

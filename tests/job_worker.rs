@@ -175,6 +175,33 @@ impl RefreshingTransfer {
     }
 }
 
+#[derive(Clone, Default)]
+struct AlwaysUnauthorizedTransfer {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AlwaysUnauthorizedTransfer {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl TransferClient for AlwaysUnauthorizedTransfer {
+    async fn transfer(
+        &self,
+        _request: DownloadRequest,
+        _destination: &Path,
+        _cancel: CancellationToken,
+        _progress: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<DownloadOutcome, TransferError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(TransferError::Download(DownloadError::Http(
+            reqwest::StatusCode::UNAUTHORIZED,
+        )))
+    }
+}
+
 #[async_trait]
 impl TransferClient for RefreshingTransfer {
     async fn transfer(
@@ -716,6 +743,39 @@ async fn worker_refreshes_once_after_an_initial_401_without_consuming_a_retry() 
     assert_eq!(transfer.calls(), 2);
     assert_eq!(store.job(job.id).await.state, JobState::Ready);
     assert_eq!(store.job(job.id).await.attempt, 1);
+}
+
+#[tokio::test]
+async fn worker_stops_after_one_auth_reresolution_when_the_refreshed_source_also_fails() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "refresh-401-twice", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([
+        Ok(resolved_source("http://example.com/first.mkv", Some(13))),
+        Ok(resolved_source(
+            "http://example.com/refreshed.mkv",
+            Some(13),
+        )),
+    ]));
+    let transfer = AlwaysUnauthorizedTransfer::default();
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog.clone(),
+        Arc::new(transfer.clone()),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        WorkerRunOutcome::Progressed
+    );
+    assert_eq!(catalog.resolve_count(), 2);
+    assert_eq!(transfer.calls(), 2);
+    let after = store.job(job.id).await;
+    assert_eq!(after.state, JobState::Queued);
+    assert_eq!(after.attempt, 1);
 }
 
 #[tokio::test]

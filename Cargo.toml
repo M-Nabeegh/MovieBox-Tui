@@ -29,6 +29,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 lru = "0.18.1"
 md-5 = "0.11.0"
 rand = "0.10.2"
+quick-xml = "0.42.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
