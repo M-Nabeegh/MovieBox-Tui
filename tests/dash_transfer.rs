@@ -61,6 +61,10 @@ fn dash_manifest_rejects_entity_encoded_unsafe_references() {
         validate_manifest(br#"<MPD><BaseURL>&#x66;ile:///etc/passwd</BaseURL></MPD>"#),
         Err(DashError::UnsafeManifestReference)
     ));
+    assert!(matches!(
+        validate_manifest(br#"<MPD><BaseURL>&amp;#x66;ile:///etc/passwd</BaseURL></MPD>"#),
+        Err(DashError::UnsafeManifestReference)
+    ));
 }
 
 #[test]
@@ -291,23 +295,25 @@ async fn dash_transfer_maps_guarded_segment_403_to_an_auth_error_and_cleans_up()
 }
 
 #[tokio::test]
-async fn dash_transfer_rejects_an_unadvertised_proxy_path_fail_closed() {
+async fn dash_transfer_ignores_wrong_token_and_unadvertised_proxy_probes() {
     let server = FixtureServer::start_dash(dash_manifest(), b"fixture-segment".to_vec())
         .await
         .unwrap();
     let tools = fake_media_tools(tempdir().unwrap(), FakeMediaOutput::UnauthorizedPath);
     let transfer = DashTransfer::with_tools(server.client(), &tools.ffmpeg, &tools.ffprobe);
     let workspace = tempdir().unwrap();
-    let error = transfer
+    let destination = workspace.path().join("blocked.mkv");
+    let result = transfer
         .transfer(
             dash_request(server.url("/manifest.mpd")),
-            &workspace.path().join("blocked.mkv"),
+            &destination,
             CancellationToken::new(),
             mpsc::unbounded_channel().0,
         )
         .await
-        .unwrap_err();
-    assert!(matches!(error, DashError::ProxySecurity));
+        .unwrap();
+    assert_eq!(result, DownloadOutcome::Completed { bytes: 13 });
+    assert_eq!(fs::read(destination).unwrap(), b"fixture-media");
     assert!(
         server
             .requests()
@@ -535,6 +541,7 @@ grep -qi 'content-type: video/iso.segment' "$headers_file"
 case "{mode}" in
   unauthorized-path)
     if curl --fail --silent "${{input%/*}}/unadvertised.m4s" >/dev/null; then exit 88; fi
+    curl --fail --silent --path-as-is "${{input%/*}}/../wrong-token/segment.m4s" >/dev/null || true
     printf 'fixture-media' > "$output"
     ;;
   feature) printf 'fixture-media' > "$output" ;;

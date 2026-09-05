@@ -29,9 +29,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::Command,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{Semaphore, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
-    time::sleep,
+    time::{Instant, sleep, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -52,6 +52,8 @@ const NOTICE_DURATION_TOLERANCE_SECONDS: f64 = 0.5;
 const NOTICE_SIZE_BYTES: u64 = 917_554;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const DASH_PROXY_CONNECTIONS: usize = 1;
+const DASH_PROXY_HEADER_TIMEOUT: Duration = Duration::from_millis(250);
+const DASH_PROXY_MAX_HEADER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MediaProbe {
@@ -192,6 +194,7 @@ impl DashTransfer {
             cancel.clone(),
         )
         .await?;
+        validate_proxy_tool_url(&proxy.url)?;
         let result = async {
             let selected_video_stream = match self
                 .probe_video_stream(&proxy.url, maximum_height, cancel.clone())
@@ -313,6 +316,7 @@ impl DashTransfer {
         maximum_height: u16,
         cancel: CancellationToken,
     ) -> Result<u32, DashError> {
+        validate_proxy_tool_url(manifest_url)?;
         let mut child = Command::new(&self.ffprobe)
             .args([
                 OsString::from("-v"),
@@ -393,6 +397,17 @@ impl DashTransfer {
     }
 }
 
+fn validate_proxy_tool_url(url: &Url) -> Result<(), DashError> {
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || !url.path().starts_with("/__dash/")
+        || !url.path().ends_with("/manifest.mpd")
+    {
+        return Err(DashError::UnsafeManifestReference);
+    }
+    Ok(())
+}
+
 struct MonitorGuard(JoinHandle<()>);
 
 impl MonitorGuard {
@@ -415,6 +430,45 @@ impl Drop for MonitorGuard {
 struct DashCapability {
     path_template: String,
     query_template: Option<String>,
+    path_pattern: DashTemplate,
+    query_pattern: Option<DashTemplate>,
+}
+
+#[derive(Clone, Debug)]
+struct DashTemplate {
+    pieces: Vec<DashTemplatePiece>,
+}
+
+#[derive(Clone, Debug)]
+enum DashTemplatePiece {
+    Literal(String),
+    Variable {
+        kind: DashVariable,
+        width: Option<usize>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DashVariable {
+    Number,
+    Time,
+    Bandwidth,
+    RepresentationId,
+}
+
+impl DashVariable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Number => "Number",
+            Self::Time => "Time",
+            Self::Bandwidth => "Bandwidth",
+            Self::RepresentationId => "RepresentationID",
+        }
+    }
+
+    fn numeric(self) -> bool {
+        !matches!(self, Self::RepresentationId)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -491,23 +545,39 @@ impl DashProxy {
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
-                tokio::select! {
+                while connections.try_join_next().is_some() {}
+                let permit = tokio::select! {
                     _ = &mut shutdown_rx => break,
                     _ = task_cancel.cancelled() => break,
-                    accepted = listener.accept() => {
-                        let (stream, _) = match accepted {
-                            Ok(value) => value,
-                            Err(_) => {
-                                record_proxy_failure(&state.failure, ProxyFailure::Network);
-                                break;
-                            }
-                        };
-                        let state = state.clone();
-                        connections.spawn(async move {
-                            let _ = serve_dash_proxy_connection(stream, state).await;
-                        });
+                    permit = state.connections.clone().acquire_owned() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    },
+                };
+                let accepted = tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        drop(permit);
+                        break;
                     }
-                }
+                    _ = task_cancel.cancelled() => {
+                        drop(permit);
+                        break;
+                    }
+                    accepted = listener.accept() => accepted,
+                };
+                let (stream, _) = match accepted {
+                    Ok(value) => value,
+                    Err(_) => {
+                        drop(permit);
+                        record_proxy_failure(&state.failure, ProxyFailure::Network);
+                        break;
+                    }
+                };
+                let state = state.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let _ = serve_dash_proxy_connection(stream, state).await;
+                });
             }
             connections.abort_all();
             while connections.join_next().await.is_some() {}
@@ -558,8 +628,7 @@ async fn serve_dash_proxy_connection(
     mut stream: TcpStream,
     state: DashProxyState,
 ) -> Result<(), std::io::Error> {
-    let _permit = acquire_proxy_permit(&state).await?;
-    let request = read_dash_proxy_request(&mut stream).await?;
+    let request = read_dash_proxy_request(&mut stream, state.cancel.clone()).await?;
     if request.method != Method::GET {
         write_dash_proxy_headers(
             &mut stream,
@@ -583,7 +652,10 @@ async fn serve_dash_proxy_connection(
             Some(state.manifest.len() as u64),
         )
         .await?;
-        stream.write_all(&state.manifest).await?;
+        tokio::select! {
+            result = stream.write_all(&state.manifest) => result?,
+            _ = state.cancel.cancelled() => return Ok(()),
+        }
         return Ok(());
     }
 
@@ -592,7 +664,6 @@ async fn serve_dash_proxy_connection(
     let upstream = match proxy_target_url(&state, &local_url) {
         Ok(upstream) => upstream,
         Err(_) => {
-            record_proxy_failure(&state.failure, ProxyFailure::Security);
             write_dash_proxy_headers(
                 &mut stream,
                 StatusCode::NOT_FOUND,
@@ -642,7 +713,10 @@ async fn serve_dash_proxy_connection(
                         _ = state.cancel.cancelled() => return Ok(()),
                     };
                     let Some(chunk) = chunk else { break };
-                    stream.write_all(&chunk).await?;
+                    tokio::select! {
+                        result = stream.write_all(&chunk) => result?,
+                        _ = state.cancel.cancelled() => return Ok(()),
+                    }
                 }
             }
         }
@@ -658,17 +732,6 @@ async fn serve_dash_proxy_connection(
         }
     }
     Ok(())
-}
-
-async fn acquire_proxy_permit(
-    state: &DashProxyState,
-) -> Result<OwnedSemaphorePermit, std::io::Error> {
-    state
-        .connections
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| std::io::Error::other("DASH proxy is shutting down"))
 }
 
 fn classify_proxy_failure(error: &NetSecurityError) -> ProxyFailure {
@@ -698,6 +761,7 @@ fn proxy_error_or(error: DashError, proxy: &DashProxy) -> DashError {
     proxy_error(proxy).unwrap_or(error)
 }
 
+#[derive(Debug)]
 struct DashProxyRequest {
     method: Method,
     target: String,
@@ -706,26 +770,41 @@ struct DashProxyRequest {
 
 async fn read_dash_proxy_request(
     stream: &mut TcpStream,
+    cancel: CancellationToken,
 ) -> Result<DashProxyRequest, std::io::Error> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
+    let deadline = Instant::now() + DASH_PROXY_HEADER_TIMEOUT;
     loop {
-        let read = stream.read(&mut chunk).await?;
+        let read = tokio::select! {
+            read = timeout_at(deadline, stream.read(&mut chunk)) => {
+                read.map_err(|_| std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "proxy request headers timed out",
+                ))??
+            }
+            _ = cancel.cancelled() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "proxy request cancelled",
+                ));
+            }
+        };
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "proxy request ended before headers",
             ));
         }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-        if bytes.len() > 64 * 1024 {
+        if bytes.len().saturating_add(read) > DASH_PROXY_MAX_HEADER_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "proxy request headers are too large",
             ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
         }
     }
     let text = String::from_utf8_lossy(&bytes);
@@ -787,11 +866,16 @@ async fn write_dash_proxy_headers(
             response.push_str("\r\n");
         }
     }
-    if let Some(length) = body_length.or_else(|| {
-        upstream_headers
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok()?.parse().ok())
-    }) {
+    let length = if status.is_success() || status == StatusCode::PARTIAL_CONTENT {
+        body_length.or_else(|| {
+            upstream_headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()?.parse().ok())
+        })
+    } else {
+        Some(0)
+    };
+    if let Some(length) = length {
         response.push_str(&format!("Content-Length: {length}\r\n"));
     }
     response.push_str("Connection: close\r\n\r\n");
@@ -896,60 +980,193 @@ fn random_proxy_token() -> String {
 }
 
 impl DashCapability {
+    fn new(path_template: String, query_template: Option<String>) -> Result<Self, DashError> {
+        let path_pattern = DashTemplate::parse(&path_template)?;
+        let query_pattern = query_template
+            .as_deref()
+            .map(DashTemplate::parse)
+            .transpose()?;
+        Ok(Self {
+            path_template: path_pattern.render(),
+            query_template: query_pattern.as_ref().map(DashTemplate::render),
+            path_pattern,
+            query_pattern,
+        })
+    }
+
     fn matches(&self, path: &str, query: Option<&str>) -> bool {
-        template_matches(&self.path_template, path)
+        self.path_pattern.matches(path, false)
             && match (&self.query_template, query) {
                 (None, None) => true,
-                (Some(expected), Some(actual)) => template_matches(expected, actual),
+                (Some(_), Some(actual)) => self
+                    .query_pattern
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.matches(actual, true)),
                 _ => false,
             }
     }
 }
 
+#[cfg(test)]
 fn template_matches(template: &str, value: &str) -> bool {
-    let mut literals = Vec::<(&str, bool)>::new();
-    let mut cursor = 0;
-    while cursor < template.len() {
-        let Some(start_offset) = template[cursor..].find('$') else {
-            literals.push((&template[cursor..], false));
-            break;
-        };
-        let start = cursor + start_offset;
-        literals.push((&template[cursor..start], false));
-        let Some(end_offset) = template[start + 1..].find('$') else {
-            return false;
-        };
-        cursor = start + 1 + end_offset + 1;
-        literals.push(("", true));
+    DashTemplate::parse(template)
+        .map(|pattern| pattern.matches(value, false))
+        .unwrap_or(false)
+}
+
+impl DashTemplate {
+    fn parse(template: &str) -> Result<Self, DashError> {
+        let mut pieces = Vec::new();
+        let mut cursor = 0;
+        let mut literal_start = 0;
+        let bytes = template.as_bytes();
+        while cursor < bytes.len() {
+            if bytes[cursor] != b'$' {
+                cursor += 1;
+                continue;
+            }
+            if cursor + 1 < bytes.len() && bytes[cursor + 1] == b'$' {
+                if literal_start < cursor {
+                    pieces.push(DashTemplatePiece::Literal(
+                        template[literal_start..cursor].to_owned(),
+                    ));
+                }
+                pieces.push(DashTemplatePiece::Literal("$".to_owned()));
+                cursor += 2;
+                literal_start = cursor;
+                continue;
+            }
+            if literal_start < cursor {
+                pieces.push(DashTemplatePiece::Literal(
+                    template[literal_start..cursor].to_owned(),
+                ));
+            }
+            let Some(end_offset) = template[cursor + 1..].find('$') else {
+                return Err(DashError::InvalidManifest(
+                    "unbalanced DASH template variable",
+                ));
+            };
+            let end = cursor + 1 + end_offset;
+            let token = &template[cursor + 1..end];
+            let variable = parse_dash_variable(token)?;
+            if matches!(pieces.last(), Some(DashTemplatePiece::Variable { .. })) {
+                return Err(DashError::InvalidManifest(
+                    "adjacent DASH template variables",
+                ));
+            }
+            pieces.push(DashTemplatePiece::Variable {
+                kind: variable.0,
+                width: variable.1,
+            });
+            cursor = end + 1;
+            literal_start = cursor;
+        }
+        if literal_start < template.len() {
+            pieces.push(DashTemplatePiece::Literal(
+                template[literal_start..].to_owned(),
+            ));
+        }
+        Ok(Self { pieces })
     }
-    if literals.is_empty() {
-        return value.is_empty();
+
+    fn render(&self) -> String {
+        let mut rendered = String::new();
+        for piece in &self.pieces {
+            match piece {
+                DashTemplatePiece::Literal(value) => rendered.push_str(value),
+                DashTemplatePiece::Variable { kind, width } => {
+                    rendered.push('$');
+                    rendered.push_str(kind.name());
+                    if let Some(width) = width {
+                        rendered.push_str(&format!("%0{width}d"));
+                    }
+                    rendered.push('$');
+                }
+            }
+        }
+        rendered
     }
-    let mut remainder = value;
-    let mut wildcard_seen = false;
-    for (literal, wildcard) in literals {
-        if wildcard {
-            wildcard_seen = true;
-            continue;
+
+    fn matches(&self, value: &str, query: bool) -> bool {
+        let mut offset = 0;
+        for (index, piece) in self.pieces.iter().enumerate() {
+            match piece {
+                DashTemplatePiece::Literal(literal) => {
+                    if !value[offset..].starts_with(literal) {
+                        return false;
+                    }
+                    offset += literal.len();
+                }
+                DashTemplatePiece::Variable { kind, width } => {
+                    let next_literal = self.pieces[index + 1..].iter().find_map(|piece| {
+                        if let DashTemplatePiece::Literal(literal) = piece {
+                            (!literal.is_empty()).then_some(literal.as_str())
+                        } else {
+                            None
+                        }
+                    });
+                    let end = next_literal
+                        .and_then(|literal| {
+                            value[offset..].find(literal).map(|index| offset + index)
+                        })
+                        .unwrap_or(value.len());
+                    if end < offset
+                        || !valid_dash_variable(*kind, *width, &value[offset..end], query)
+                    {
+                        return false;
+                    }
+                    offset = end;
+                }
+            }
         }
-        if literal.is_empty() {
-            continue;
-        }
-        if !wildcard_seen && !remainder.starts_with(literal) {
-            return false;
-        }
-        if let Some(index) = if wildcard_seen {
-            remainder.find(literal)
-        } else {
-            Some(0)
-        } {
-            remainder = &remainder[index + literal.len()..];
-        } else {
-            return false;
-        }
+        offset == value.len()
     }
-    let ends_with_wildcard = template.ends_with('$');
-    ends_with_wildcard || remainder.is_empty()
+}
+
+fn parse_dash_variable(token: &str) -> Result<(DashVariable, Option<usize>), DashError> {
+    let (name, format) = token.split_once('%').unwrap_or((token, ""));
+    let kind = match name {
+        "Number" => DashVariable::Number,
+        "Time" => DashVariable::Time,
+        "Bandwidth" => DashVariable::Bandwidth,
+        "RepresentationID" => DashVariable::RepresentationId,
+        _ => {
+            return Err(DashError::InvalidManifest(
+                "unsupported DASH template variable",
+            ));
+        }
+    };
+    if format.is_empty() {
+        return Ok((kind, None));
+    }
+    if !kind.numeric() || !(format.ends_with('d') || format.ends_with('i')) {
+        return Err(DashError::InvalidManifest("invalid DASH template format"));
+    }
+    let digits = &format[..format.len() - 1];
+    if digits.is_empty() {
+        return Ok((kind, None));
+    }
+    let width = digits
+        .parse::<usize>()
+        .ok()
+        .filter(|width| *width > 0 && *width <= 64)
+        .ok_or(DashError::InvalidManifest("invalid DASH template format"))?;
+    Ok((kind, Some(width)))
+}
+
+fn valid_dash_variable(kind: DashVariable, width: Option<usize>, value: &str, query: bool) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if kind.numeric() {
+        value.bytes().all(|byte| byte.is_ascii_digit())
+            && width.is_none_or(|width| value.len() >= width)
+    } else {
+        !value.contains(['/', '?', '#', '\\', '%'])
+            && (!query || !value.contains('&'))
+            && value != "."
+            && value != ".."
+    }
 }
 
 fn parse_dash_manifest(
@@ -992,7 +1209,13 @@ fn parse_dash_manifest(
                 }
                 let parent_base = stack
                     .last()
-                    .map(|element| element.base.clone())
+                    .map(|element| {
+                        if name == "BaseURL" {
+                            element.inherited_base.clone()
+                        } else {
+                            element.base.clone()
+                        }
+                    })
                     .unwrap_or_else(|| remote_url.clone());
                 let (rewritten, is_base) = rewrite_manifest_start(
                     &start,
@@ -1007,6 +1230,11 @@ fn parse_dash_manifest(
                 stack.push(ManifestElement {
                     name: name.to_string(),
                     base: parent_base,
+                    inherited_base: stack
+                        .last()
+                        .map(|element| element.base.clone())
+                        .unwrap_or_else(|| remote_url.clone()),
+                    has_base_url: false,
                     is_base,
                     base_text: String::new(),
                 });
@@ -1025,7 +1253,13 @@ fn parse_dash_manifest(
                 }
                 let parent_base = stack
                     .last()
-                    .map(|element| element.base.clone())
+                    .map(|element| {
+                        if name == "BaseURL" {
+                            element.inherited_base.clone()
+                        } else {
+                            element.base.clone()
+                        }
+                    })
                     .unwrap_or_else(|| remote_url.clone());
                 if name == "BaseURL" {
                     return Err(DashError::InvalidManifest("empty BaseURL"));
@@ -1096,8 +1330,11 @@ fn parse_dash_manifest(
                     writer
                         .write_event(Event::Text(BytesText::new(&route)))
                         .map_err(|_| DashError::InvalidManifest("could not rewrite manifest"))?;
-                    if let Some(parent) = stack.last_mut() {
+                    if let Some(parent) = stack.last_mut()
+                        && !parent.has_base_url
+                    {
                         parent.base = target;
+                        parent.has_base_url = true;
                     }
                 }
                 writer
@@ -1133,6 +1370,8 @@ fn parse_dash_manifest(
 struct ManifestElement {
     name: String,
     base: Url,
+    inherited_base: Url,
+    has_base_url: bool,
     is_base: bool,
     base_text: String,
 }
@@ -1203,22 +1442,24 @@ fn canonicalize_dash_reference(
     }
     target.set_fragment(None);
     let path = target.path().to_string();
-    if path.to_ascii_lowercase().ends_with(".mpd") {
+    let reference_path = value.split(['?', '#']).next().unwrap_or_default();
+    if path.to_ascii_lowercase().ends_with(".mpd")
+        && (!reference_path.is_empty() || path != remote_url.path())
+    {
         return Err(DashError::UnsafeManifestReference);
     }
     let query_template = target.query().map(str::to_owned);
-    let capability = DashCapability {
-        path_template: path.clone(),
-        query_template: query_template.clone(),
-    };
+    let capability = DashCapability::new(path, query_template)?;
+    let route_path = capability.path_template.clone();
+    let route_query = capability.query_template.clone();
     if !capabilities.iter().any(|existing| {
         existing.path_template == capability.path_template
             && existing.query_template == capability.query_template
     }) {
         capabilities.push(capability);
     }
-    let mut route = format!("/__dash/{token}{path}");
-    if let Some(query) = query_template {
+    let mut route = format!("/__dash/{token}{route_path}");
+    if let Some(query) = route_query {
         route.push('?');
         route.push_str(&query);
     }
@@ -1226,21 +1467,35 @@ fn canonicalize_dash_reference(
 }
 
 fn decode_xml_entities(value: &str) -> Result<String, DashError> {
-    if !value.contains(';') {
-        if value.contains("<!") {
-            return Err(DashError::UnsafeManifestReference);
+    let mut output = value.to_owned();
+    for _ in 0..4 {
+        if !output.contains(';') {
+            break;
         }
-        return Ok(value.to_string());
+        let decoded = quick_xml::escape::unescape_with(&output, |entity| {
+            quick_xml::escape::resolve_predefined_entity(entity)
+        })
+        .map_err(|_| DashError::UnsafeManifestReference)?
+        .into_owned();
+        if decoded == output {
+            break;
+        }
+        output = decoded;
     }
-    let output = quick_xml::escape::unescape_with(value, |entity| {
-        quick_xml::escape::resolve_predefined_entity(entity)
-    })
-    .map_err(|_| DashError::UnsafeManifestReference)?
-    .into_owned();
-    if output.contains("<!") {
+    if output.contains("<!") || has_unresolved_entity_reference(&output) {
         return Err(DashError::UnsafeManifestReference);
     }
     Ok(output)
+}
+
+fn has_unresolved_entity_reference(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.windows(2).enumerate().any(|(index, pair)| {
+        if pair[0] != b'&' || !(pair[1].is_ascii_alphanumeric() || pair[1] == b'#') {
+            return false;
+        }
+        value[index + 2..].find(';').is_some()
+    })
 }
 
 fn reject_external_text(value: &str) -> Result<(), DashError> {
@@ -1453,6 +1708,13 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::{DashCapability, parse_dash_manifest, template_matches};
+    use std::net::Ipv4Addr;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        time::{Duration, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
     use url::Url;
 
     #[test]
@@ -1486,11 +1748,115 @@ mod tests {
 
     #[test]
     fn capability_matching_requires_an_exact_opaque_token_route() {
-        let capability = DashCapability {
-            path_template: "/segments/$Number$.m4s".to_string(),
-            query_template: None,
-        };
+        let capability = DashCapability::new("/segments/$Number$.m4s".to_string(), None).unwrap();
         assert!(capability.matches("/segments/3.m4s", None));
         assert!(!capability.matches("/segments/3.m4s", Some("x=1")));
+    }
+
+    #[test]
+    fn capability_templates_enforce_dash_variable_grammar_and_safe_values() {
+        let remote = Url::parse("https://cdn.example.invalid/index.mpd").unwrap();
+        let numeric = parse_dash_manifest(
+            br#"<MPD><Period><SegmentTemplate media="seg-$Number%05d$.m4s" /></Period></MPD>"#,
+            &remote,
+            "opaque-token",
+        )
+        .unwrap();
+        let numeric = &numeric.capabilities[0];
+        assert!(numeric.matches("/seg-00017.m4s", None));
+        assert!(!numeric.matches("/seg-1/secret.m4s", None));
+        assert!(!numeric.matches("/seg-%2fsecret.m4s", None));
+        assert!(!numeric.matches("/seg-../secret.m4s", None));
+
+        let literal = parse_dash_manifest(
+            br#"<MPD><Period><SegmentTemplate media="seg-$$.m4s" /></Period></MPD>"#,
+            &remote,
+            "opaque-token",
+        )
+        .unwrap();
+        assert_eq!(literal.capabilities[0].path_template, "/seg-$.m4s");
+
+        for value in [
+            br#"<MPD><Period><SegmentTemplate media="seg-$Unknown$.m4s" /></Period></MPD>"#
+                .as_slice(),
+            br#"<MPD><Period><SegmentTemplate media="seg-$Number.m4s" /></Period></MPD>"#
+                .as_slice(),
+            br#"<MPD><Period><SegmentTemplate media="seg-$Number%bogus$.m4s" /></Period></MPD>"#
+                .as_slice(),
+        ] {
+            assert!(parse_dash_manifest(value, &remote, "opaque-token").is_err());
+        }
+    }
+
+    #[test]
+    fn baseurl_siblings_keep_their_immutable_inherited_base_and_query_only_is_allowed() {
+        let remote = Url::parse("https://cdn.example.invalid/path/index.mpd").unwrap();
+        let manifest = br#"<MPD><Period><AdaptationSet><BaseURL>a/</BaseURL><SegmentTemplate media="one.m4s" /></AdaptationSet><AdaptationSet><BaseURL>b/</BaseURL><SegmentTemplate media="two.m4s" /></AdaptationSet></Period></MPD>"#;
+        let parsed = parse_dash_manifest(manifest, &remote, "opaque-token").unwrap();
+        assert!(
+            parsed
+                .capabilities
+                .iter()
+                .any(|capability| capability.path_template == "/path/a/one.m4s")
+        );
+        assert!(
+            parsed
+                .capabilities
+                .iter()
+                .any(|capability| capability.path_template == "/path/b/two.m4s")
+        );
+
+        let query_only = br#"<MPD><Period><BaseURL>?signed=fixture</BaseURL><SegmentTemplate media="segment.m4s" /></Period></MPD>"#;
+        assert!(parse_dash_manifest(query_only, &remote, "opaque-token").is_ok());
+    }
+
+    #[tokio::test]
+    async fn incomplete_proxy_headers_time_out_without_waiting_forever() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let _client = client;
+        server
+            .write_all(b"GET /__dash/token/manifest.mpd HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            super::read_dash_proxy_request(&mut server, CancellationToken::new()),
+        )
+        .await
+        .expect("header reader should have its own timeout")
+        .unwrap_err();
+        assert_eq!(result.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn omitted_error_bodies_advertise_zero_content_length() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("17"),
+        );
+        super::write_dash_proxy_headers(
+            &mut server,
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+            Some(17),
+        )
+        .await
+        .unwrap();
+        let mut response = [0_u8; 2048];
+        let read = timeout(Duration::from_secs(1), client.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(response[..read].to_vec()).unwrap();
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(!response.contains("Content-Length: 17"));
     }
 }
