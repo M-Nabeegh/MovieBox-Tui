@@ -146,21 +146,28 @@ impl DashTransfer {
             return Ok(DownloadOutcome::Paused { bytes: 0 });
         }
         let expected_duration = require_provider_duration(expected_duration_seconds)?;
-        let response = follow_checked_redirects_same_origin(
-            &self.client,
-            Method::GET,
-            request.url.clone(),
-            request.headers.clone(),
-            request.maximum_redirects,
-            request.url.clone(),
-        )
-        .await
-        .map_err(DownloadError::from)?;
+        let response = tokio::select! {
+            response = follow_checked_redirects_same_origin(
+                &self.client,
+                Method::GET,
+                request.url.clone(),
+                request.headers.clone(),
+                request.maximum_redirects,
+                request.url.clone(),
+            ) => response.map_err(DownloadError::from)?,
+            _ = cancel.cancelled() => return Ok(DownloadOutcome::Paused { bytes: 0 }),
+        };
         if !response.status().is_success() {
             return Err(DashError::Download(DownloadError::Http(response.status())));
         }
         let remote_url = response.url().clone();
-        let manifest = read_bounded_manifest(response, cancel.clone()).await?;
+        let manifest = match read_bounded_manifest(response, cancel.clone()).await {
+            Ok(manifest) => manifest,
+            Err(DashError::Cancelled) if cancel.is_cancelled() => {
+                return Ok(DownloadOutcome::Paused { bytes: 0 });
+            }
+            Err(error) => return Err(error),
+        };
         let manifest_text =
             std::str::from_utf8(&manifest).map_err(|_| DashError::InvalidManifest("not UTF-8"))?;
         let representations = manifest_tag_chunks(manifest_text, "Representation");
