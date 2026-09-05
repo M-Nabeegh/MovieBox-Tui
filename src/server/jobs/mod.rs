@@ -1,3 +1,4 @@
+pub mod dash;
 mod model;
 mod recovery;
 mod repository;

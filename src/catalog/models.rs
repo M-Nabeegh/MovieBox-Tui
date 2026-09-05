@@ -127,6 +127,8 @@ pub struct SubtitleTrack {
     pub format: Option<String>,
 }
 
+pub use crate::source::SourceTransport;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeRequest {
     pub catalog_id: CatalogId,
@@ -141,6 +143,7 @@ pub struct ResolvedSource {
     pub subtitle: Option<ResolvedSubtitle>,
     pub extension: String,
     pub expected_size: Option<u64>,
+    pub transport: SourceTransport,
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,55 @@
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "title": "Fixture Series",
+    "displayResolutions": "2160,1080,720",
+    "streams": [
+      {
+        "id": "resource-fixture-2160",
+        "resourceId": "resource-fixture-2160",
+        "resolution": 2160,
+        "format": "DASH",
+        "codecName": "hevc",
+        "duration": 5400,
+        "size": "9900000000",
+        "url": "https://notice.example.invalid/upgrade.mp4",
+        "signCookie": "CloudFront-Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9jZG4uZXhhbXBsZS5pbnZhbGlkL2Rhc2gvcmVzb3VyY2UtZml4dHVyZS0yMTYwLyoifV19;CloudFront-Signature=fake-signature-2160;CloudFront-Key-Pair-Id=KFAKE2160"
+      },
+      {
+        "id": "resource-fixture-1080",
+        "resourceId": "resource-fixture-1080",
+        "resolution": 1080,
+        "se": 1,
+        "ep": 2,
+        "format": "DASH",
+        "codecName": "hevc",
+        "duration": 5400,
+        "size": "3900000000",
+        "url": "https://notice.example.invalid/upgrade.mp4",
+        "signCookie": "CloudFront-Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9jZG4uZXhhbXBsZS5pbnZhbGlkL2Rhc2gvcmVzb3VyY2UtZml4dHVyZS0xMDgwLyoiLCJDb25kaXRpb24iOnsiRGF0ZUxlc3NUaGFuIjp7IkFXUzpFcG9jaFRpbWUiOjQxMDI0NDQ4MDB9fX1dfQ==;CloudFront-Signature=fake-signature-1080;CloudFront-Key-Pair-Id=KFAKE1080"
+      },
+      {
+        "id": "resource-fixture-720",
+        "resourceId": "resource-fixture-720",
+        "resolution": 720,
+        "se": 1,
+        "ep": 2,
+        "format": "DASH",
+        "codecName": "h264",
+        "duration": 5400,
+        "size": "2100000000",
+        "url": "https://notice.example.invalid/upgrade.mp4",
+        "signCookie": "CloudFront-Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9jZG4uZXhhbXBsZS5pbnZhbGlkL2Rhc2gvcmVzb3VyY2UtZml4dHVyZS03MjAvKiJ9XX0=;CloudFront-Signature=fake-signature-720;CloudFront-Key-Pair-Id=KFAKE720"
+      },
+      {
+        "id": "resource-fixture-invalid",
+        "resourceId": "resource-fixture-invalid",
+        "resolution": 1080,
+        "duration": 5400,
+        "url": "https://notice.example.invalid/upgrade.mp4",
+        "signCookie": "CloudFront-Policy=not-a-policy;CloudFront-Signature=fake-signature-invalid;CloudFront-Key-Pair-Id=KFAKEINVALID"
+      }
+    ]
+  }
+}

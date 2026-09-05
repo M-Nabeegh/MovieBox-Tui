@@ -2,14 +2,15 @@ use crate::catalog::CatalogProvider;
 use crate::catalog::models::{
     AudioOption, CatalogDetails, CatalogError, CatalogId, CatalogItem, EpisodeInfo, EpisodeRequest,
     MediaType, OpaqueIdCodec, OpaquePayload, QualityPolicy, ResolvedSource, ResolvedSubtitle,
-    SearchPage, SeasonInfo, SourceId, SourceOption, SubtitleId, SubtitleTrack,
+    SearchPage, SeasonInfo, SourceId, SourceOption, SourceTransport, SubtitleId, SubtitleTrack,
 };
 use crate::providers::moviebox::clean_moviebox_title;
 use crate::providers::moviebox::client::{MovieBoxClient, ScraperError};
 use async_trait::async_trait;
-use reqwest::header::HeaderMap;
+use base64::Engine;
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, REFERER};
 use serde_json::Value;
-use std::borrow::Cow;
+use std::{borrow::Cow, net::IpAddr};
 use url::Url;
 
 const MOVIEBOX_PROVIDER: &str = "moviebox";
@@ -211,6 +212,237 @@ fn parse_optional_u64_field(value: &Value, key: &'static str) -> Option<u64> {
             .as_u64()
             .or_else(|| field.as_i64().and_then(|number| u64::try_from(number).ok()))
             .or_else(|| field.as_str().and_then(|text| text.parse::<u64>().ok()))
+    })
+}
+
+fn stream_text<'a>(stream: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| stream.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn stream_number(stream: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        stream.get(*key).and_then(|field| {
+            field
+                .as_f64()
+                .or_else(|| field.as_str().and_then(|value| value.parse().ok()))
+        })
+    })
+}
+
+fn stream_height_values(stream: &Value) -> Vec<u16> {
+    let mut values = Vec::new();
+    for key in ["resolution", "height"] {
+        if let Some(value) = stream.get(key) {
+            if let Some(number) = value
+                .as_u64()
+                .and_then(|number| u16::try_from(number).ok())
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+            {
+                values.push(number);
+            }
+        }
+    }
+    if let Some(value) = stream.get("resolutions") {
+        match value {
+            Value::String(text) => values.extend(
+                text.split(',')
+                    .filter_map(|part| part.trim().parse::<u16>().ok()),
+            ),
+            Value::Array(items) => values.extend(items.iter().filter_map(|item| {
+                item.as_u64()
+                    .and_then(|number| u16::try_from(number).ok())
+                    .or_else(|| item.as_str().and_then(|text| text.parse().ok()))
+            })),
+            _ => {}
+        }
+    }
+    values.sort_unstable_by(|left, right| right.cmp(left));
+    values.dedup();
+    values
+}
+
+/// Decode a signed CloudFront policy and derive the DASH manifest URL.
+///
+/// The legacy URL field is intentionally ignored. It is where MovieBox has
+/// historically returned the short upgrade/notice clip.
+pub fn resolve_dash_manifest_from_policy(sign_cookie: &str) -> Option<Url> {
+    let encoded = sign_cookie.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("CloudFront-Policy=")
+            .filter(|value| !value.trim().is_empty())
+    })?;
+    let padding = (4 - encoded.len() % 4) % 4;
+    let padded = format!("{encoded}{}", "=".repeat(padding));
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&padded))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&padded))
+        .ok()?;
+    let policy: Value = serde_json::from_slice(&bytes).ok()?;
+    let resource = policy
+        .get("Statement")
+        .and_then(Value::as_array)
+        .and_then(|statements| statements.first())
+        .and_then(|statement| statement.get("Resource"))
+        .and_then(Value::as_str)?;
+    let resource = resource.trim_end_matches('*').trim_end_matches('/');
+    let mut manifest = Url::parse(&format!("{resource}/index.mpd")).ok()?;
+    if !is_public_dash_url(&manifest) {
+        return None;
+    }
+    manifest.set_query(None);
+    manifest.set_fragment(None);
+    Some(manifest)
+}
+
+fn is_public_dash_url(url: &Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+    {
+        return false;
+    }
+    let Some(address) = host.parse::<IpAddr>().ok() else {
+        return true;
+    };
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_loopback()
+                && !address.is_unspecified()
+                && !address.is_private()
+                && !address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            let first = address.segments()[0];
+            !address.is_loopback()
+                && !address.is_unspecified()
+                && (first & 0xfe00) != 0xfc00
+                && (first & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// Adapt one authenticated play-info/v2 payload into the internal DASH
+/// transfer contract. Resolution and episode/resource identity are matched
+/// before a signed policy is accepted; no legacy notice URL is ever selected.
+pub fn resolve_play_info_source(
+    payload: &Value,
+    resource_id: &str,
+    season: Option<u16>,
+    episode: Option<u16>,
+    requested_height: u16,
+    user_agent: &str,
+) -> Result<ResolvedSource, CatalogError> {
+    if requested_height == 0 || requested_height > 1080 {
+        return Err(CatalogError::QualityUnavailable {
+            maximum_height: 1080,
+            requested_height: Some(requested_height),
+        });
+    }
+    let data = payload.get("data").unwrap_or(payload);
+    let streams = data
+        .get("streams")
+        .and_then(Value::as_array)
+        .ok_or(CatalogError::InvalidPayload("streams"))?;
+    let mut invalid_policy_for_match = false;
+    let mut candidates = Vec::new();
+
+    for stream in streams {
+        let id = stream_text(stream, &["resourceId", "resource_id", "id"]);
+        if id != Some(resource_id) {
+            continue;
+        }
+        let stream_se = stream.get("se").and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u16::try_from(number).ok())
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        });
+        let stream_ep = stream.get("ep").and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u16::try_from(number).ok())
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        });
+        if season.is_some_and(|wanted| stream_se != Some(wanted))
+            || episode.is_some_and(|wanted| stream_ep != Some(wanted))
+        {
+            continue;
+        }
+        let heights = stream_height_values(stream);
+        let candidate_height = heights
+            .iter()
+            .copied()
+            .filter(|height| *height <= requested_height)
+            .max()
+            .or_else(|| stream_number(stream, &["resolution", "height"]).map(|value| value as u16));
+        if candidate_height.is_none_or(|height| height > requested_height) {
+            continue;
+        }
+        let Some(sign_cookie) = stream.get("signCookie").and_then(Value::as_str) else {
+            invalid_policy_for_match = true;
+            continue;
+        };
+        let Some(manifest_url) = resolve_dash_manifest_from_policy(sign_cookie) else {
+            invalid_policy_for_match = true;
+            continue;
+        };
+        if HeaderValue::from_str(sign_cookie).is_err() {
+            invalid_policy_for_match = true;
+            continue;
+        }
+        candidates.push((
+            candidate_height.unwrap_or(requested_height),
+            stream,
+            sign_cookie,
+            manifest_url,
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.3.as_str().cmp(right.3.as_str()))
+    });
+    let Some((height, stream, sign_cookie, url)) = candidates.into_iter().next() else {
+        if invalid_policy_for_match {
+            return Err(CatalogError::InvalidPayload("signed CloudFront policy"));
+        }
+        return Err(CatalogError::NotFound("source"));
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(REFERER, HeaderValue::from_static("https://sportslive.wine"));
+    let user_agent = HeaderValue::from_str(user_agent)
+        .map_err(|_| CatalogError::InvalidPayload("user-agent"))?;
+    headers.insert(reqwest::header::USER_AGENT, user_agent);
+    headers.insert(
+        COOKIE,
+        HeaderValue::from_str(sign_cookie)
+            .map_err(|_| CatalogError::InvalidPayload("signed cookie"))?,
+    );
+    let expected_duration_seconds =
+        stream_number(stream, &["duration", "durationSeconds", "duration_seconds"]);
+
+    Ok(ResolvedSource {
+        url,
+        headers,
+        subtitle: None,
+        extension: "mkv".to_string(),
+        expected_size: None,
+        transport: SourceTransport::Dash {
+            maximum_height: requested_height.min(height),
+            expected_duration_seconds,
+        },
     })
 }
 
@@ -634,11 +866,22 @@ impl CatalogProvider for MovieBoxCatalogProvider {
         let item =
             find_source_item(&payload, &resource_id).ok_or(CatalogError::NotFound("source"))?;
         validate_source_item_resolution(item, height, self.quality_policy)?;
-        let url = Url::parse(string_field(item, "resourceLink")?)
-            .map_err(|_| CatalogError::InvalidPayload("resourceLink"))?;
-        let expected_size = parse_optional_u64_field(item, "sizeBytes")
-            .or_else(|| parse_optional_u64_field(item, "size"));
-        let extension = parse_extension(url.as_str(), "mkv");
+        let play_info = self
+            .client
+            .get_play_info(
+                &subject_id,
+                usize::from(season.unwrap_or_default()),
+                usize::from(episode.unwrap_or_default()),
+            )
+            .await?;
+        let mut resolved = resolve_play_info_source(
+            &play_info,
+            &resource_id,
+            season,
+            episode,
+            height,
+            self.client.user_agent(),
+        )?;
 
         let resolved_subtitle = if let Some(subtitle) = subtitle {
             let (subtitle_provider, subtitle_subject_id, subtitle_resource_id, index, _, _) =
@@ -657,12 +900,7 @@ impl CatalogProvider for MovieBoxCatalogProvider {
             None
         };
 
-        Ok(ResolvedSource {
-            url,
-            headers: self.client.media_headers(),
-            subtitle: resolved_subtitle,
-            extension,
-            expected_size,
-        })
+        resolved.subtitle = resolved_subtitle;
+        Ok(resolved)
     }
 }

@@ -75,6 +75,8 @@ pub enum TransferError {
     #[error(transparent)]
     Download(#[from] DownloadError),
     #[error(transparent)]
+    Dash(#[from] super::dash::DashError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
@@ -109,6 +111,18 @@ impl TransferClient for HttpTransferClient {
         cancel: CancellationToken,
         progress: mpsc::UnboundedSender<TransferProgress>,
     ) -> Result<DownloadOutcome, TransferError> {
+        if matches!(
+            request.transport,
+            crate::catalog::SourceTransport::Dash { .. }
+        ) {
+            return super::dash::DashTransfer::new(self.client.clone())
+                .transfer(request, destination, cancel, progress)
+                .await
+                .map_err(|error| match error {
+                    super::dash::DashError::Download(download) => TransferError::Download(download),
+                    error => TransferError::Dash(error),
+                });
+        }
         let flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = Arc::clone(&flag);
         let watcher = tokio::spawn(async move {
@@ -594,7 +608,11 @@ where
             .await?;
         self.publish(&downloading, JobEventKind::StateChanged);
 
-        // Keep the catalog's full-file size across the transfer. A CDN error
+        let dash_transfer = matches!(
+            &resolved.transport,
+            crate::catalog::SourceTransport::Dash { .. }
+        );
+        // Keep the catalog's full-file size across an ordinary HTTP transfer. A CDN error
         // page or promotional clip can be a perfectly complete HTTP response
         // with its own (much smaller) Content-Length; trusting that response
         // alone would publish the wrong video as a successful download.
@@ -627,7 +645,7 @@ where
         // the file on disk against the expected length before publishing it.
         // Handing a truncated movie to the media library looks like success and
         // is only discovered when someone tries to watch it.
-        if !self.transferred_size_matches(&finalized).await? {
+        if !dash_transfer && !self.transferred_size_matches(&finalized).await? {
             if may_retry(finalized.attempt) {
                 self.reschedule(
                     &finalized,
@@ -957,6 +975,7 @@ where
             url: subtitle.url,
             headers: subtitle.headers,
             maximum_redirects: 5,
+            transport: crate::catalog::SourceTransport::HttpFile,
         };
         let token = CancellationToken::new();
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
@@ -1156,6 +1175,7 @@ fn build_request(resolved: &ResolvedSource) -> DownloadRequest {
         url: resolved.url.clone(),
         headers: resolved.headers.clone(),
         maximum_redirects: 5,
+        transport: resolved.transport.clone(),
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::providers::moviebox::crypto::build_signed_headers;
+use crate::providers::moviebox::session::MovieBoxSession;
 use reqwest::Response;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
@@ -33,7 +34,8 @@ pub enum ScraperError {
 #[derive(Clone)]
 pub struct MovieBoxClient {
     client: reqwest::Client,
-    runtime_token: Arc<RwLock<Option<String>>>,
+    session: Arc<RwLock<Option<MovieBoxSession>>>,
+    session_lock: Arc<tokio::sync::Mutex<()>>,
     active_base_idx: Arc<AtomicUsize>,
     user_agent: String,
     client_info: String,
@@ -63,7 +65,8 @@ impl MovieBoxClient {
 
         Self {
             client,
-            runtime_token: Arc::new(RwLock::new(None)),
+            session: Arc::new(RwLock::new(None)),
+            session_lock: Arc::new(tokio::sync::Mutex::new(())),
             active_base_idx: Arc::new(AtomicUsize::new(0)),
             user_agent,
             client_info,
@@ -73,6 +76,10 @@ impl MovieBoxClient {
 
     pub fn http_client(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
     }
 
     /// Headers required when using a resolved MovieBox media URL.
@@ -88,18 +95,85 @@ impl MovieBoxClient {
     }
 
     pub async fn init(&self) -> Result<(), ScraperError> {
-        let path = "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version=";
-        let _ = self.request_hosts("GET", path, None).await?;
+        self.ensure_session().await.map(|_| ())
+    }
 
-        let has_token = self
-            .runtime_token
+    /// Reuse a valid visitor token and serialize login when several requests
+    /// arrive at the same time.  The token remains process-local only.
+    pub async fn ensure_session(&self) -> Result<String, ScraperError> {
+        if let Some(session) = self
+            .session
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some();
-        if !has_token {
-            return Err(ScraperError::MissingToken);
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            && session.is_valid()
+        {
+            return Ok(session.token().to_string());
         }
-        Ok(())
+
+        let _guard = self.session_lock.lock().await;
+        if let Some(session) = self
+            .session
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            && session.is_valid()
+        {
+            return Ok(session.token().to_string());
+        }
+
+        let payload = self
+            .request_hosts(
+                "POST",
+                "/wefeed-mobile-bff/user-api/visitor-login",
+                Some("{}"),
+                None,
+            )
+            .await?;
+        let token = payload
+            .get("token")
+            .or_else(|| payload.get("data").and_then(|data| data.get("token")))
+            .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+            .ok_or(ScraperError::MissingToken)?;
+        let user_id = payload
+            .get("uid")
+            .or_else(|| payload.get("userId"))
+            .or_else(|| payload.get("data").and_then(|data| data.get("uid")))
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| value.as_u64().map(|number| number.to_string()))
+                    .or_else(|| value.as_i64().map(|number| number.to_string()))
+            });
+        let session = MovieBoxSession::from_token_and_payload(token.to_string(), user_id);
+        let token = session.token().to_string();
+        *self
+            .session
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(session);
+        Ok(token)
+    }
+
+    pub fn invalidate_session(&self) {
+        *self
+            .session
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+
+    fn invalidate_session_if(&self, token: &str) {
+        let mut session = self
+            .session
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if session
+            .as_ref()
+            .is_some_and(|current| current.token() == token)
+        {
+            *session = None;
+        }
     }
 
     async fn absorb_x_user(&self, headers: &reqwest::header::HeaderMap) {
@@ -116,11 +190,19 @@ impl MovieBoxClient {
             return;
         };
         if !token.is_empty() {
-            let mut write_token = self
-                .runtime_token
+            let mut write_session = self
+                .session
                 .write()
-                .unwrap_or_else(|e| e.into_inner());
-            *write_token = Some(token.to_string());
+                .unwrap_or_else(|poison| poison.into_inner());
+            *write_session = Some(MovieBoxSession::from_token_and_payload(
+                token.to_string(),
+                json.get("uid").and_then(|value| {
+                    value
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .or_else(|| value.as_u64().map(|number| number.to_string()))
+                }),
+            ));
         }
     }
 
@@ -139,18 +221,16 @@ impl MovieBoxClient {
         path_and_query: &str,
         body: Option<&str>,
     ) -> Result<Value, ScraperError> {
-        match self.request_hosts(method, path_and_query, body).await {
-            Err(ScraperError::HostsExhausted) => {
-                let has_token = self
-                    .runtime_token
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_some();
-                if has_token {
-                    return Err(ScraperError::HostsExhausted);
-                }
-                let _ = self.init().await;
-                self.request_hosts(method, path_and_query, body).await
+        let token = self.ensure_session().await?;
+        match self
+            .request_hosts(method, path_and_query, body, Some(&token))
+            .await
+        {
+            Err(ScraperError::ApiStatus(401 | 403)) => {
+                self.invalidate_session_if(&token);
+                let fresh_token = self.ensure_session().await?;
+                self.request_hosts(method, path_and_query, body, Some(&fresh_token))
+                    .await
             }
             result => result,
         }
@@ -161,8 +241,10 @@ impl MovieBoxClient {
         method: &str,
         path_and_query: &str,
         body: Option<&str>,
+        auth_token: Option<&str>,
     ) -> Result<Value, ScraperError> {
         let start_idx = self.active_base_idx.load(Ordering::Relaxed);
+        let mut auth_status = None;
 
         for i in 0..HOST_POOL.len() {
             if i > 0 {
@@ -172,16 +254,11 @@ impl MovieBoxClient {
             let base = HOST_POOL[idx];
             let url = format!("{}{}", base, path_and_query);
 
-            let token = self
-                .runtime_token
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
             let headers = build_signed_headers(
                 method,
                 &url,
                 body,
-                token.as_deref(),
+                auth_token,
                 &self.user_agent,
                 &self.client_info,
                 &self.spoofed_ip,
@@ -202,6 +279,10 @@ impl MovieBoxClient {
                     self.absorb_x_user(resp.headers()).await;
                     let status = resp.status().as_u16();
 
+                    if matches!(status, 401 | 403) {
+                        auth_status = Some(status);
+                        continue;
+                    }
                     if RETRY_STATUS_CODES.contains(&status) {
                         log::warn!(
                             "moviebox host {idx} returned retryable status {status}: {}",
@@ -233,6 +314,9 @@ impl MovieBoxClient {
             }
         }
 
+        if let Some(status) = auth_status {
+            return Err(ScraperError::ApiStatus(status));
+        }
         log::error!("moviebox: all hosts exhausted for [redacted]");
         Err(ScraperError::HostsExhausted)
     }

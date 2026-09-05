@@ -3,6 +3,7 @@ pub mod download;
 pub mod history;
 pub mod logging;
 pub mod providers;
+pub mod source;
 pub mod tui;
 
 #[cfg(feature = "server")]

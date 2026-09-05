@@ -5,9 +5,9 @@ mod fixtures;
 
 use fixtures::fixture;
 use moviebox_tui::catalog::{
-    CatalogError, MediaType, OpaqueIdCodec, OpaquePayload, QualityPolicy,
+    CatalogError, MediaType, OpaqueIdCodec, OpaquePayload, QualityPolicy, SourceTransport,
     moviebox::{
-        adapt_details, adapt_search_page, adapt_sources, adapt_subtitles,
+        adapt_details, adapt_search_page, adapt_sources, adapt_subtitles, resolve_play_info_source,
         validate_source_item_resolution,
     },
 };
@@ -200,4 +200,61 @@ fn opaque_ids_round_trip_without_exposing_fixture_identifiers() {
     assert!(!encoded.contains("https://"));
     assert!(!encoded.contains("subject-fixture-2"));
     assert!(!encoded.contains("resource-fixture-1080"));
+}
+
+#[test]
+fn play_info_selects_signed_mpd_and_keeps_resource_episode_identity() {
+    let payload = fixture("moviebox-play-info.json");
+
+    let resolved = resolve_play_info_source(
+        &payload,
+        "resource-fixture-1080",
+        Some(1),
+        Some(2),
+        1080,
+        "FixtureAndroid/1.0",
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved.url.as_str(),
+        "https://cdn.example.invalid/dash/resource-fixture-1080/index.mpd"
+    );
+    assert!(!resolved.url.as_str().contains("upgrade"));
+    assert!(
+        resolved
+            .headers
+            .get("cookie")
+            .is_some_and(|value| value.to_str().unwrap().contains("CloudFront-Policy="))
+    );
+    assert_eq!(
+        resolved.headers.get("user-agent").unwrap(),
+        "FixtureAndroid/1.0"
+    );
+    assert_eq!(
+        resolved.transport,
+        SourceTransport::Dash {
+            maximum_height: 1080,
+            expected_duration_seconds: Some(5400.0),
+        }
+    );
+}
+
+#[test]
+fn play_info_rejects_invalid_policy_without_falling_back_to_notice_url() {
+    let payload = fixture("moviebox-play-info.json");
+
+    let error = resolve_play_info_source(
+        &payload,
+        "resource-fixture-invalid",
+        None,
+        None,
+        1080,
+        "FixtureAndroid/1.0",
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CatalogError::InvalidPayload(_)));
+    let rendered = error.to_string();
+    assert!(!rendered.contains("upgrade.example.invalid"));
 }

@@ -1,6 +1,7 @@
 pub mod adapt;
 pub mod client;
 pub mod crypto;
+pub mod session;
 pub mod title;
 
 pub use title::clean_moviebox_title;
@@ -50,6 +51,22 @@ fn resource_page_path(
 }
 
 impl MovieBoxClient {
+    pub async fn get_play_info(
+        &self,
+        subject_id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Value, ScraperError> {
+        let path = if season == 0 && episode == 0 {
+            format!("/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}")
+        } else {
+            format!(
+                "/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={season}&ep={episode}"
+            )
+        };
+        self.get(&path).await
+    }
+
     pub async fn search(&self, query: &str, page: usize) -> Result<Value, ScraperError> {
         let payload = json!({
             "keyword": query,

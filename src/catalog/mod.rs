@@ -9,7 +9,7 @@ use std::sync::Arc;
 pub use models::{
     AudioOption, CatalogDetails, CatalogError, CatalogId, CatalogItem, EpisodeInfo, EpisodeRequest,
     MediaType, OpaqueIdCodec, OpaquePayload, QualityPolicy, ResolvedSource, ResolvedSubtitle,
-    SearchPage, SeasonInfo, SourceId, SourceOption, SubtitleId, SubtitleTrack,
+    SearchPage, SeasonInfo, SourceId, SourceOption, SourceTransport, SubtitleId, SubtitleTrack,
 };
 pub use quality::QualityTier;
 

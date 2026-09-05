@@ -44,6 +44,7 @@ impl App {
                 url,
                 headers: headers.clone(),
                 maximum_redirects: 5,
+                transport: crate::source::SourceTransport::HttpFile,
             },
             Err(error) => {
                 self.state.notify(
@@ -61,6 +62,7 @@ impl App {
                     url,
                     headers: headers.clone(),
                     maximum_redirects: 5,
+                    transport: crate::source::SourceTransport::HttpFile,
                 })
             })
             .transpose();

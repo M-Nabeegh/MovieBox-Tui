@@ -48,6 +48,16 @@ rather than finalized, so a truncated video is never handed to Jellyfin as a
 complete item. Sources that do not advertise a length cannot be checked this way
 and are accepted as-is.
 
+MovieBox's current video path is authenticated MPEG-DASH rather than a single
+HTTP file. The worker obtains a visitor session, resolves a signed `index.mpd`,
+and fetches it through the same public-network and redirect checks as other
+downloads. FFmpeg uses stream copy/remuxing (`-c copy`) to keep CPU use low; it
+does not transcode. FFprobe must confirm a video stream and a duration close to
+the provider's value, which rejects the roughly 20-second upgrade/notice clip.
+Because DASH segment state cannot be resumed safely across a changed signed
+manifest, a retry starts the contained output from zero. Authorization values
+are request-only and are never written to logs, job state, or error messages.
+
 ## Disk space
 
 The worker defers a job when free space would drop below

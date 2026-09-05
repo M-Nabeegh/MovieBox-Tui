@@ -32,6 +32,7 @@ async fn download_sends_required_headers_on_redirects_segment_retries_and_resume
         url: server.url("/redirect/download"),
         headers: FixtureServer::required_headers(),
         maximum_redirects: 4,
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     };
 
     let outcome = download(
@@ -97,6 +98,7 @@ async fn download_sends_required_headers_on_resume_requests() {
         url: server.url("/download"),
         headers: FixtureServer::required_headers(),
         maximum_redirects: 2,
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     };
 
     let outcome = download(

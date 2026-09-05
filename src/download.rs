@@ -18,6 +18,8 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
+use crate::source::SourceTransport;
+
 #[cfg(feature = "server")]
 pub use crate::server::security::net::DownloadClient;
 
@@ -96,6 +98,7 @@ pub struct DownloadRequest {
     pub url: Url,
     pub headers: HeaderMap,
     pub maximum_redirects: u8,
+    pub transport: SourceTransport,
 }
 
 impl DownloadRequest {
@@ -104,6 +107,7 @@ impl DownloadRequest {
             url,
             headers: HeaderMap::new(),
             maximum_redirects: DEFAULT_MAXIMUM_REDIRECTS,
+            transport: SourceTransport::HttpFile,
         }
     }
 }

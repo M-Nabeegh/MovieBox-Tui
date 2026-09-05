@@ -187,6 +187,7 @@ fn resolved_source(url: &str, expected_size: Option<u64>) -> ResolvedSource {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size,
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     }
 }
 
@@ -593,6 +594,7 @@ async fn worker_completes_one_job_and_finalizes_into_the_library() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = harness.worker(
         store.clone(),
@@ -641,6 +643,7 @@ async fn worker_rejects_a_transfer_smaller_than_the_catalog_advertised() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some((server.content_len() * 2) as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = harness.worker(
         store.clone(),
@@ -682,6 +685,7 @@ async fn transfer_failure_after_progress_does_not_stop_worker_on_version_conflic
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(10),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = JobWorker::new(
         store.clone(),
@@ -863,6 +867,7 @@ async fn requested_subtitle_is_downloaded_next_to_the_video() {
         }),
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     };
     // The worker resolves once to download the video and again for the subtitle.
     let catalog = Arc::new(MockCatalog::new([Ok(with_subtitle()), Ok(with_subtitle())]));
@@ -907,6 +912,7 @@ async fn subtitle_without_a_destination_warns_instead_of_silently_skipping() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = JobWorker::new(
         store.clone(),
@@ -938,6 +944,7 @@ async fn completed_job_triggers_a_single_library_refresh() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let library = Arc::new(CountingRefresher::default());
     let worker = JobWorker::new(
@@ -970,6 +977,7 @@ async fn completed_job_announces_the_title_as_ready_to_watch() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let notifier = Arc::new(RecordingNotifier::default());
     let worker = JobWorker::new(
@@ -1057,6 +1065,7 @@ async fn insufficient_space_event_is_sanitized() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let bus = JobEventBus::new(16);
     let mut events = bus.subscribe();
@@ -1103,6 +1112,7 @@ async fn low_disk_run_stops_after_defer() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     });
     let catalog = Arc::new(MockCatalog::new([resolved]));
     let bus = JobEventBus::new(16);
@@ -1227,6 +1237,7 @@ async fn a_downloaded_subtitle_is_aligned_against_its_video() {
         }),
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     };
     let catalog = Arc::new(MockCatalog::new([Ok(with_subtitle()), Ok(with_subtitle())]));
     let store = Arc::new(MockStore::with_jobs([job.clone()]));
@@ -1289,6 +1300,7 @@ async fn a_download_without_a_subtitle_is_never_sent_for_alignment() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let syncer = Arc::new(RecordingSyncer::default());
     let worker = JobWorker::new(

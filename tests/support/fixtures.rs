@@ -6,7 +6,8 @@ pub fn fixture(name: &str) -> Value {
         "moviebox-search.json"
         | "moviebox-details.json"
         | "moviebox-resources.json"
-        | "moviebox-captions.json" => name,
+        | "moviebox-captions.json"
+        | "moviebox-play-info.json" => name,
         _ => panic!("{name}"),
     };
 
