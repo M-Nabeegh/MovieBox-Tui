@@ -51,7 +51,10 @@ const NOTICE_DURATION_SECONDS: f64 = 20.97;
 const NOTICE_DURATION_TOLERANCE_SECONDS: f64 = 0.5;
 const NOTICE_SIZE_BYTES: u64 = 917_554;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
-const DASH_PROXY_CONNECTIONS: usize = 1;
+// FFmpeg keeps the selected video and audio representations in flight at the
+// same time. Keep a small bounded pool so those requests cannot deadlock while
+// still limiting the worker's pressure on the server and upstream CDN.
+const DASH_PROXY_CONNECTIONS: usize = 4;
 const DASH_PROXY_HEADER_TIMEOUT: Duration = Duration::from_millis(250);
 const DASH_PROXY_MAX_HEADER_BYTES: usize = 64 * 1024;
 
