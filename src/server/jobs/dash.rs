@@ -34,6 +34,7 @@ use tokio::{
     time::{Instant, sleep, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use url::Url;
 
 use crate::{
@@ -671,6 +672,7 @@ async fn serve_dash_proxy_connection(
     let upstream = match proxy_target_url(&state, &local_url) {
         Ok(upstream) => upstream,
         Err(_) => {
+            warn!("DASH proxy rejected a manifest capability request");
             write_dash_proxy_headers(
                 &mut stream,
                 StatusCode::NOT_FOUND,
@@ -742,6 +744,21 @@ async fn serve_dash_proxy_connection(
 }
 
 fn classify_proxy_failure(error: &NetSecurityError) -> ProxyFailure {
+    let reason = match error {
+        NetSecurityError::InvalidScheme(_) => "invalid_scheme",
+        NetSecurityError::MissingHost => "missing_host",
+        NetSecurityError::DnsLookup { .. } => "dns_lookup",
+        NetSecurityError::NoResolvedAddresses(_) => "no_resolved_addresses",
+        NetSecurityError::UnsafeAddress(_) => "unsafe_address",
+        NetSecurityError::ConnectedAddressUnavailable => "connected_address_unavailable",
+        NetSecurityError::ConnectedAddressMismatch(_) => "connected_address_mismatch",
+        NetSecurityError::MissingRedirectLocation => "missing_redirect_location",
+        NetSecurityError::InvalidRedirectTarget(_) => "invalid_redirect_target",
+        NetSecurityError::RedirectOutsideOrigin => "redirect_outside_origin",
+        NetSecurityError::RedirectLimitExceeded(_) => "redirect_limit_exceeded",
+        NetSecurityError::Request(_) => "request",
+    };
+    warn!(reason, "DASH proxy upstream request rejected");
     match error {
         NetSecurityError::Request(_) => ProxyFailure::Network,
         _ => ProxyFailure::Security,
