@@ -34,7 +34,7 @@ use tokio::{
     time::{Instant, sleep, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use log::warn;
 use url::Url;
 
 use crate::{
