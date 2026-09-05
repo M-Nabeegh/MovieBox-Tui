@@ -34,7 +34,6 @@ use tokio::{
     time::{Instant, sleep, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
-use log::warn;
 use url::Url;
 
 use crate::{
@@ -672,7 +671,7 @@ async fn serve_dash_proxy_connection(
     let upstream = match proxy_target_url(&state, &local_url) {
         Ok(upstream) => upstream,
         Err(_) => {
-            warn!("DASH proxy rejected a manifest capability request");
+            eprintln!("DASH proxy rejected a manifest capability request");
             write_dash_proxy_headers(
                 &mut stream,
                 StatusCode::NOT_FOUND,
@@ -758,7 +757,7 @@ fn classify_proxy_failure(error: &NetSecurityError) -> ProxyFailure {
         NetSecurityError::RedirectLimitExceeded(_) => "redirect_limit_exceeded",
         NetSecurityError::Request(_) => "request",
     };
-    warn!("DASH proxy upstream request rejected (reason={reason})");
+    eprintln!("DASH proxy upstream request rejected (reason={reason})");
     match error {
         NetSecurityError::Request(_) => ProxyFailure::Network,
         _ => ProxyFailure::Security,
