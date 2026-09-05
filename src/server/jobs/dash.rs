@@ -495,7 +495,13 @@ impl DashProxy {
                     _ = &mut shutdown_rx => break,
                     _ = task_cancel.cancelled() => break,
                     accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { break; };
+                        let (stream, _) = match accepted {
+                            Ok(value) => value,
+                            Err(_) => {
+                                record_proxy_failure(&state.failure, ProxyFailure::Network);
+                                break;
+                            }
+                        };
                         let state = state.clone();
                         connections.spawn(async move {
                             let _ = serve_dash_proxy_connection(stream, state).await;
@@ -626,7 +632,13 @@ async fn serve_dash_proxy_connection(
             if status.is_success() || status == StatusCode::PARTIAL_CONTENT {
                 loop {
                     let chunk = tokio::select! {
-                        chunk = response.chunk() => chunk.map_err(|error| std::io::Error::other(error.to_string()))?,
+                        chunk = response.chunk() => match chunk {
+                            Ok(chunk) => chunk,
+                            Err(error) => {
+                                record_proxy_failure(&state.failure, ProxyFailure::Network);
+                                return Err(std::io::Error::other(error.to_string()));
+                            }
+                        },
                         _ = state.cancel.cancelled() => return Ok(()),
                     };
                     let Some(chunk) = chunk else { break };
@@ -950,7 +962,7 @@ fn parse_dash_manifest(
     }
     let text = std::str::from_utf8(bytes).map_err(|_| DashError::InvalidManifest("not UTF-8"))?;
     let lowered = text.to_ascii_lowercase();
-    if lowered.contains("<!") || lowered.contains("doctype") {
+    if lowered.contains("<!") {
         return Err(DashError::UnsafeManifestReference);
     }
 
