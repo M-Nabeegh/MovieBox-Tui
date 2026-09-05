@@ -6,7 +6,10 @@ mod support;
 use moviebox_tui::{
     download::{DownloadRequest, download},
     server::security::{
-        net::{follow_checked_redirects, resolve_public_addresses, validate_public_http_url},
+        net::{
+            follow_checked_redirects, follow_checked_redirects_same_origin,
+            resolve_public_addresses, validate_public_http_url,
+        },
         path::contained_path,
     },
 };
@@ -177,6 +180,27 @@ async fn redirects_to_private_targets_are_rejected_before_following() {
     .unwrap_err();
 
     assert!(error.to_string().contains("127.0.0.1"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn scoped_redirects_reject_a_different_remote_origin_before_forwarding_auth() {
+    let server = FixtureServer::start(1024).await.unwrap();
+    let client = server.client();
+    let origin = server.url("/download");
+
+    let error = follow_checked_redirects_same_origin(
+        &client,
+        Method::GET,
+        server.url("/redirect/private"),
+        FixtureServer::required_headers(),
+        2,
+        origin,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("origin"));
     assert_eq!(server.requests().len(), 1);
 }
 

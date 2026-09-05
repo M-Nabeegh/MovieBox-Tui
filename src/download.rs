@@ -7,6 +7,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    fmt,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -93,12 +94,36 @@ pub enum DownloadOutcome {
     Paused { bytes: u64 },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DownloadRequest {
     pub url: Url,
     pub headers: HeaderMap,
     pub maximum_redirects: u8,
     pub transport: SourceTransport,
+}
+
+struct RedactedHeaders<'a>(&'a HeaderMap);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = formatter.debug_map();
+        for name in self.0.keys() {
+            map.entry(&name.as_str(), &"[redacted]");
+        }
+        map.finish()
+    }
+}
+
+impl fmt::Debug for DownloadRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DownloadRequest")
+            .field("url", &crate::logging::sanitize_url(self.url.as_str()))
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("maximum_redirects", &self.maximum_redirects)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 impl DownloadRequest {

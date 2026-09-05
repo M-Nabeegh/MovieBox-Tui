@@ -3,6 +3,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::fmt;
 use thiserror::Error;
 use url::Url;
 
@@ -136,14 +137,44 @@ pub struct EpisodeRequest {
     pub episode: Option<u16>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedSource {
     pub url: Url,
     pub headers: HeaderMap,
     pub subtitle: Option<ResolvedSubtitle>,
     pub extension: String,
     pub expected_size: Option<u64>,
+    /// Provider-advertised size used for capacity planning. DASH remux output
+    /// must not be compared byte-for-byte with this value.
+    pub catalog_size_bytes: Option<u64>,
     pub transport: SourceTransport,
+}
+
+struct RedactedHeaders<'a>(&'a HeaderMap);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = formatter.debug_map();
+        for name in self.0.keys() {
+            map.entry(&name.as_str(), &"[redacted]");
+        }
+        map.finish()
+    }
+}
+
+impl fmt::Debug for ResolvedSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedSource")
+            .field("url", &crate::logging::sanitize_url(self.url.as_str()))
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("subtitle", &self.subtitle.as_ref().map(|_| "[redacted]"))
+            .field("extension", &self.extension)
+            .field("expected_size", &self.expected_size)
+            .field("catalog_size_bytes", &self.catalog_size_bytes)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

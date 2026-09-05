@@ -476,7 +476,7 @@ where
                 return Ok(());
             }
 
-            match self.run_once().await? {
+            match self.run_once_with_cancel(cancel.clone()).await? {
                 WorkerRunOutcome::Progressed => continue,
                 WorkerRunOutcome::Deferred => return Ok(()),
                 WorkerRunOutcome::NoJob => {}
@@ -493,16 +493,27 @@ where
     }
 
     pub async fn run_once(&self) -> Result<WorkerRunOutcome, WorkerError> {
+        self.run_once_with_cancel(CancellationToken::new()).await
+    }
+
+    async fn run_once_with_cancel(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<WorkerRunOutcome, WorkerError> {
         let Some(job) = self.store.claim_next().await? else {
             return Ok(WorkerRunOutcome::NoJob);
         };
 
         self.publish(&job, JobEventKind::Claimed);
 
-        self.process_claimed_job(job).await
+        self.process_claimed_job(job, cancel).await
     }
 
-    async fn process_claimed_job(&self, job: DownloadJob) -> Result<WorkerRunOutcome, WorkerError> {
+    async fn process_claimed_job(
+        &self,
+        job: DownloadJob,
+        cancel: CancellationToken,
+    ) -> Result<WorkerRunOutcome, WorkerError> {
         if !self.paths_are_safe(&job) {
             fail_job(
                 self.store.as_ref(),
@@ -573,7 +584,8 @@ where
         // the remainder still has to fit. Charging the full size again would
         // stall a nearly finished resume behind a space check it cannot pass.
         let expected_size = resolved
-            .expected_size
+            .catalog_size_bytes
+            .or(resolved.expected_size)
             .unwrap_or(0)
             .saturating_sub(self.partial_bytes_on_disk(&job).await);
         if available <= self.reserve_bytes.saturating_add(expected_size) {
@@ -617,7 +629,9 @@ where
         // with its own (much smaller) Content-Length; trusting that response
         // alone would publish the wrong video as a successful download.
         let catalog_expected_size = resolved.expected_size.filter(|size| *size > 0);
-        let download = self.download_with_refresh(downloading, resolved).await?;
+        let download = self
+            .download_with_refresh(downloading, resolved, cancel)
+            .await?;
         let completed = match download {
             Some(job) => job,
             None => return Ok(WorkerRunOutcome::Progressed),
@@ -733,6 +747,7 @@ where
         &self,
         downloading: DownloadJob,
         mut resolved: ResolvedSource,
+        worker_cancel: CancellationToken,
     ) -> Result<Option<DownloadJob>, WorkerError> {
         self.validated_partial_path(&downloading, &downloading.partial_video_path)?;
         let video_destination =
@@ -746,7 +761,7 @@ where
 
         let mut refreshes = 0_u8;
         loop {
-            let token = CancellationToken::new();
+            let token = worker_cancel.child_token();
 
             let request = build_request(&resolved);
             let outcome = self
@@ -841,7 +856,7 @@ where
                     let Some(progress) = maybe_progress else {
                         continue;
                     };
-                    current_job = self
+                    current_job = match self
                         .store
                         .update_progress(
                             current_job.id,
@@ -854,12 +869,19 @@ where
                             None,
                         )
                         .await
-                        .map_err(map_repo_as_io)?;
+                    {
+                        Ok(job) => job,
+                        Err(error) => {
+                            token.cancel();
+                            let _ = transfer.as_mut().await;
+                            return Err(map_repo_as_io(error));
+                        }
+                    };
                     self.publish(&current_job, JobEventKind::ProgressUpdated);
                 }
                 outcome = &mut transfer => {
                     while let Ok(progress) = progress_rx.try_recv() {
-                        current_job = self
+                        current_job = match self
                             .store
                             .update_progress(
                                 current_job.id,
@@ -872,7 +894,14 @@ where
                                 None,
                             )
                             .await
-                            .map_err(map_repo_as_io)?;
+                        {
+                            Ok(job) => job,
+                            Err(error) => {
+                                token.cancel();
+                                let _ = transfer.as_mut().await;
+                                return Err(map_repo_as_io(error));
+                            }
+                        };
                         self.publish(&current_job, JobEventKind::ProgressUpdated);
                     }
                     return match outcome? {
@@ -1186,7 +1215,7 @@ fn active_transfer_path(partial_relative: &str) -> Option<PathBuf> {
 fn is_expired_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE
+        StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE
     )
 }
 

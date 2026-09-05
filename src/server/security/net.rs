@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use url::{Host, Url};
+use url::{Host, Origin, Url};
 
 pub type ResolveFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + 'a>>;
 
@@ -221,6 +221,8 @@ pub enum NetSecurityError {
     MissingRedirectLocation,
     #[error("redirect target is invalid: {0}")]
     InvalidRedirectTarget(String),
+    #[error("redirect target leaves the approved origin")]
+    RedirectOutsideOrigin,
     #[error("redirect limit exceeded after {0} hops")]
     RedirectLimitExceeded(u8),
     #[error("request failed: {0}")]
@@ -291,7 +293,49 @@ pub async fn follow_checked_redirects(
     headers: HeaderMap,
     maximum_redirects: u8,
 ) -> Result<DownloadResponse, NetSecurityError> {
+    follow_checked_redirects_inner(client, method, url, headers, maximum_redirects, None).await
+}
+
+/// Follow redirects while keeping every request on one approved origin.
+///
+/// This is used by the DASH proxy so authorization headers cannot follow a
+/// provider redirect to an unrelated host.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub async fn follow_checked_redirects_same_origin(
+    client: &DownloadClient,
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    maximum_redirects: u8,
+    approved_origin: Url,
+) -> Result<DownloadResponse, NetSecurityError> {
+    let approved_origin = approved_origin.origin();
+    follow_checked_redirects_inner(
+        client,
+        method,
+        url,
+        headers,
+        maximum_redirects,
+        Some(approved_origin),
+    )
+    .await
+}
+
+async fn follow_checked_redirects_inner(
+    client: &DownloadClient,
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    maximum_redirects: u8,
+    approved_origin: Option<Origin>,
+) -> Result<DownloadResponse, NetSecurityError> {
     let mut current = url;
+    if approved_origin
+        .as_ref()
+        .is_some_and(|origin| current.origin() != *origin)
+    {
+        return Err(NetSecurityError::RedirectOutsideOrigin);
+    }
     for redirect_count in 0..=maximum_redirects {
         let validated_addresses = client.resolve_addresses(&current).await?;
         let response = client
@@ -315,6 +359,12 @@ pub async fn follow_checked_redirects(
         current = current
             .join(location)
             .map_err(|_| NetSecurityError::InvalidRedirectTarget(location.to_string()))?;
+        if approved_origin
+            .as_ref()
+            .is_some_and(|origin| current.origin() != *origin)
+        {
+            return Err(NetSecurityError::RedirectOutsideOrigin);
+        }
     }
 
     Err(NetSecurityError::RedirectLimitExceeded(maximum_redirects))

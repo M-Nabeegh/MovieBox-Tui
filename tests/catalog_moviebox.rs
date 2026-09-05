@@ -258,3 +258,21 @@ fn play_info_rejects_invalid_policy_without_falling_back_to_notice_url() {
     let rendered = error.to_string();
     assert!(!rendered.contains("upgrade.example.invalid"));
 }
+
+#[test]
+fn play_info_fails_closed_when_resource_episode_identity_does_not_match() {
+    let mut payload = fixture("moviebox-play-info.json");
+    payload["data"]["streams"][1]["se"] = serde_json::json!(9);
+
+    let error = resolve_play_info_source(
+        &payload,
+        "resource-fixture-1080",
+        Some(1),
+        Some(2),
+        1080,
+        "FixtureAndroid/1.0",
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CatalogError::NotFound("source")));
+}

@@ -53,8 +53,12 @@ impl RecordedRequest {
 struct ServerState {
     content: Vec<u8>,
     subtitle: Vec<u8>,
+    manifest: Option<Vec<u8>>,
+    segment: Option<Vec<u8>>,
     requests: Mutex<Vec<RecordedRequest>>,
     drop_first_ranged: AtomicBool,
+    manifest_unauthorized: AtomicBool,
+    segment_forbidden: AtomicBool,
 }
 
 pub struct FixtureServer {
@@ -66,13 +70,29 @@ pub struct FixtureServer {
 
 impl FixtureServer {
     pub async fn start(content_len: usize) -> io::Result<Self> {
+        Self::start_with_dash(None, None, content_len).await
+    }
+
+    pub async fn start_dash(manifest: Vec<u8>, segment: Vec<u8>) -> io::Result<Self> {
+        Self::start_with_dash(Some(manifest), Some(segment.clone()), segment.len()).await
+    }
+
+    async fn start_with_dash(
+        manifest: Option<Vec<u8>>,
+        segment: Option<Vec<u8>>,
+        content_len: usize,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let state = Arc::new(ServerState {
             content: (0..content_len).map(|index| (index % 251) as u8).collect(),
             subtitle: b"1\n00:00:00,000 --> 00:00:01,000\nfixture subtitle\n".to_vec(),
+            manifest,
+            segment,
             requests: Mutex::new(Vec::new()),
             drop_first_ranged: AtomicBool::new(false),
+            manifest_unauthorized: AtomicBool::new(false),
+            segment_forbidden: AtomicBool::new(false),
         });
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let server_state = Arc::clone(&state);
@@ -99,6 +119,16 @@ impl FixtureServer {
             shutdown: Some(shutdown_tx),
             handle,
         })
+    }
+
+    pub fn enable_segment_forbidden(&self) {
+        self.state.segment_forbidden.store(true, Ordering::Relaxed);
+    }
+
+    pub fn enable_manifest_unauthorized(&self) {
+        self.state
+            .manifest_unauthorized
+            .store(true, Ordering::Relaxed);
     }
 
     pub fn enable_drop_first_ranged_request(&self) {
@@ -233,6 +263,63 @@ async fn handle_connection(
             .await
         }
         "/download" => serve_download(&mut stream, &request, &state).await,
+        "/manifest.mpd" => {
+            if state.manifest_unauthorized.load(Ordering::Relaxed) {
+                return write_response(
+                    &mut stream,
+                    "401 Unauthorized",
+                    &[("content-length", "0".to_string())],
+                    b"",
+                )
+                .await;
+            }
+            let Some(manifest) = &state.manifest else {
+                return write_response(
+                    &mut stream,
+                    "404 Not Found",
+                    &[("content-length", "0".to_string())],
+                    b"",
+                )
+                .await;
+            };
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[
+                    ("content-type", "application/dash+xml".to_string()),
+                    ("content-length", manifest.len().to_string()),
+                ],
+                manifest,
+            )
+            .await
+        }
+        "/segment.m4s" => {
+            if state.segment_forbidden.load(Ordering::Relaxed) {
+                return write_response(
+                    &mut stream,
+                    "403 Forbidden",
+                    &[("content-length", "0".to_string())],
+                    b"",
+                )
+                .await;
+            }
+            let Some(segment) = &state.segment else {
+                return write_response(
+                    &mut stream,
+                    "404 Not Found",
+                    &[("content-length", "0".to_string())],
+                    b"",
+                )
+                .await;
+            };
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[("content-length", segment.len().to_string())],
+                segment,
+            )
+            .await
+        }
         "/subtitle" => {
             write_response(
                 &mut stream,

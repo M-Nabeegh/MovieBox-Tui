@@ -356,22 +356,19 @@ pub fn resolve_play_info_source(
     let mut candidates = Vec::new();
 
     for stream in streams {
-        let id = stream_text(stream, &["resourceId", "resource_id", "id"]);
+        let id = stream_text(
+            stream,
+            &["resourceId", "resource_id", "streamId", "stream_id", "id"],
+        );
         if id != Some(resource_id) {
             continue;
         }
-        let stream_se = stream.get("se").and_then(|value| {
-            value
-                .as_u64()
-                .and_then(|number| u16::try_from(number).ok())
-                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-        });
-        let stream_ep = stream.get("ep").and_then(|value| {
-            value
-                .as_u64()
-                .and_then(|number| u16::try_from(number).ok())
-                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-        });
+        let stream_se = ["se", "season", "seasonNumber"]
+            .iter()
+            .find_map(|&key| parse_optional_u16_field(stream, key));
+        let stream_ep = ["ep", "episode", "episodeNumber"]
+            .iter()
+            .find_map(|&key| parse_optional_u16_field(stream, key));
         if season.is_some_and(|wanted| stream_se != Some(wanted))
             || episode.is_some_and(|wanted| stream_ep != Some(wanted))
         {
@@ -420,18 +417,23 @@ pub fn resolve_play_info_source(
         return Err(CatalogError::NotFound("source"));
     };
 
+    let expected_duration_seconds =
+        stream_number(stream, &["duration", "durationSeconds", "duration_seconds"]);
+    if expected_duration_seconds.is_none_or(|duration| {
+        !duration.is_finite() || duration <= 0.0 || (duration - 20.97).abs() <= 0.5
+    }) {
+        return Err(CatalogError::InvalidPayload("duration"));
+    }
+
     let mut headers = HeaderMap::new();
     headers.insert(REFERER, HeaderValue::from_static("https://sportslive.wine"));
     let user_agent = HeaderValue::from_str(user_agent)
         .map_err(|_| CatalogError::InvalidPayload("user-agent"))?;
     headers.insert(reqwest::header::USER_AGENT, user_agent);
-    headers.insert(
-        COOKIE,
-        HeaderValue::from_str(sign_cookie)
-            .map_err(|_| CatalogError::InvalidPayload("signed cookie"))?,
-    );
-    let expected_duration_seconds =
-        stream_number(stream, &["duration", "durationSeconds", "duration_seconds"]);
+    let mut cookie = HeaderValue::from_str(sign_cookie)
+        .map_err(|_| CatalogError::InvalidPayload("signed cookie"))?;
+    cookie.set_sensitive(true);
+    headers.insert(COOKIE, cookie);
 
     Ok(ResolvedSource {
         url,
@@ -439,6 +441,8 @@ pub fn resolve_play_info_source(
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: None,
+        catalog_size_bytes: parse_optional_u64_field(stream, "sizeBytes")
+            .or_else(|| parse_optional_u64_field(stream, "size")),
         transport: SourceTransport::Dash {
             maximum_height: requested_height.min(height),
             expected_duration_seconds,

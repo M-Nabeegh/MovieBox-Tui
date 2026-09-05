@@ -20,7 +20,7 @@ use moviebox_tui::{
         ResolvedSource, ResolvedSubtitle, SearchPage, SourceId, SourceOption, SubtitleId,
         SubtitleTrack,
     },
-    download::{DownloadOutcome, DownloadRequest},
+    download::{DownloadError, DownloadOutcome, DownloadRequest},
     server::{
         events::JobEventBus,
         jobs::{
@@ -138,6 +138,63 @@ impl TransferClient for FailingTransfer {
     }
 }
 
+#[derive(Clone, Default)]
+struct RefreshingTransfer {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Default)]
+struct CancellableTransfer {
+    observed: Arc<AtomicUsize>,
+}
+
+impl CancellableTransfer {
+    fn observed(&self) -> usize {
+        self.observed.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl TransferClient for CancellableTransfer {
+    async fn transfer(
+        &self,
+        _request: DownloadRequest,
+        _destination: &Path,
+        cancel: CancellationToken,
+        _progress: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<DownloadOutcome, TransferError> {
+        cancel.cancelled().await;
+        self.observed.fetch_add(1, Ordering::Relaxed);
+        Ok(DownloadOutcome::Paused { bytes: 0 })
+    }
+}
+
+impl RefreshingTransfer {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl TransferClient for RefreshingTransfer {
+    async fn transfer(
+        &self,
+        _request: DownloadRequest,
+        destination: &Path,
+        _cancel: CancellationToken,
+        _progress: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<DownloadOutcome, TransferError> {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        if call == 0 {
+            return Err(TransferError::Download(DownloadError::Http(
+                reqwest::StatusCode::UNAUTHORIZED,
+            )));
+        }
+        fs::write(destination, b"fixture-media").await.unwrap();
+        Ok(DownloadOutcome::Completed { bytes: 13 })
+    }
+}
+
 /// Records how many times the worker asked the media server to rescan.
 #[derive(Debug, Default)]
 struct CountingRefresher {
@@ -187,6 +244,7 @@ fn resolved_source(url: &str, expected_size: Option<u64>) -> ResolvedSource {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size,
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     }
 }
@@ -594,6 +652,7 @@ async fn worker_completes_one_job_and_finalizes_into_the_library() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = harness.worker(
@@ -628,6 +687,80 @@ async fn worker_completes_one_job_and_finalizes_into_the_library() {
 }
 
 #[tokio::test]
+async fn worker_refreshes_once_after_an_initial_401_without_consuming_a_retry() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "refresh-401", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([
+        Ok(resolved_source("http://example.com/first.mkv", Some(13))),
+        Ok(resolved_source(
+            "http://example.com/refreshed.mkv",
+            Some(13),
+        )),
+    ]));
+    let transfer = RefreshingTransfer::default();
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog.clone(),
+        Arc::new(transfer.clone()),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        WorkerRunOutcome::Progressed
+    );
+    assert_eq!(catalog.resolve_count(), 2);
+    assert_eq!(transfer.calls(), 2);
+    assert_eq!(store.job(job.id).await.state, JobState::Ready);
+    assert_eq!(store.job(job.id).await.attempt, 1);
+}
+
+#[tokio::test]
+async fn worker_shutdown_cancels_an_active_transfer_and_pauses_the_job() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "cancel-active", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let catalog = Arc::new(MockCatalog::new([Ok(resolved_source(
+        "http://example.com/active.mkv",
+        None,
+    ))]));
+    let transfer = CancellableTransfer::default();
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(transfer.clone()),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+    let cancellation = CancellationToken::new();
+    let running = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move { worker.run(cancellation).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while store.job(job.id).await.state != JobState::Downloading {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(transfer.observed(), 1);
+    assert_eq!(store.job(job.id).await.state, JobState::Paused);
+}
+
+#[tokio::test]
 async fn worker_rejects_a_transfer_smaller_than_the_catalog_advertised() {
     let harness = WorkerHarness::new();
     let server = FixtureServer::start(256 * 1024).await.unwrap();
@@ -643,6 +776,7 @@ async fn worker_rejects_a_transfer_smaller_than_the_catalog_advertised() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some((server.content_len() * 2) as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = harness.worker(
@@ -685,6 +819,7 @@ async fn transfer_failure_after_progress_does_not_stop_worker_on_version_conflic
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(10),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = JobWorker::new(
@@ -867,6 +1002,7 @@ async fn requested_subtitle_is_downloaded_next_to_the_video() {
         }),
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     };
     // The worker resolves once to download the video and again for the subtitle.
@@ -912,6 +1048,7 @@ async fn subtitle_without_a_destination_warns_instead_of_silently_skipping() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let worker = JobWorker::new(
@@ -944,6 +1081,7 @@ async fn completed_job_triggers_a_single_library_refresh() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let library = Arc::new(CountingRefresher::default());
@@ -977,6 +1115,7 @@ async fn completed_job_announces_the_title_as_ready_to_watch() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let notifier = Arc::new(RecordingNotifier::default());
@@ -1065,6 +1204,7 @@ async fn insufficient_space_event_is_sanitized() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let bus = JobEventBus::new(16);
@@ -1112,6 +1252,7 @@ async fn low_disk_run_stops_after_defer() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     });
     let catalog = Arc::new(MockCatalog::new([resolved]));
@@ -1237,6 +1378,7 @@ async fn a_downloaded_subtitle_is_aligned_against_its_video() {
         }),
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     };
     let catalog = Arc::new(MockCatalog::new([Ok(with_subtitle()), Ok(with_subtitle())]));
@@ -1300,6 +1442,7 @@ async fn a_download_without_a_subtitle_is_never_sent_for_alignment() {
         subtitle: None,
         extension: "mkv".to_string(),
         expected_size: Some(server.content_len() as u64),
+        catalog_size_bytes: None,
         transport: moviebox_tui::catalog::SourceTransport::HttpFile,
     })]));
     let syncer = Arc::new(RecordingSyncer::default());

@@ -25,4 +25,3 @@ MovieBox's legacy resource endpoint can return a small upgrade/advertisement vid
 - Deploy without overwriting `/home/nabeegh/moviebox-server/deploy/compose/compose.yml`, `.env`, `deploy/tailscale/config/`, or secret files.
 - Retry PK (2014) once. Confirm it is not the 917,554-byte, approximately 20.97-second notice and only report success after media probing shows a real video of the expected feature-length duration.
 - Confirm `/mnt/nas-data` is still the backing mount and both MovieBox and Jellyfin containers are healthy after deployment.
-
