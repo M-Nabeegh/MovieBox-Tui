@@ -163,6 +163,33 @@ impl TransferClient for ProxyNetworkTransfer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DashProgressThenFailure;
+
+#[async_trait]
+impl TransferClient for DashProgressThenFailure {
+    async fn transfer(
+        &self,
+        _request: DownloadRequest,
+        _destination: &Path,
+        _cancel: CancellationToken,
+        progress: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<DownloadOutcome, TransferError> {
+        progress
+            .send(TransferProgress {
+                downloaded_bytes: 7,
+                total_bytes: None,
+                speed_bytes_per_second: Some(123),
+            })
+            .unwrap();
+        // Let the worker consume the progress event before the transfer fails.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Err(TransferError::Dash(
+            moviebox_tui::server::jobs::dash::DashError::ProxyNetwork,
+        ))
+    }
+}
+
 #[derive(Clone, Default)]
 struct RefreshingTransfer {
     calls: Arc<AtomicUsize>,
@@ -997,6 +1024,35 @@ async fn dash_proxy_network_failure_requeues_and_keeps_partial_bytes() {
         partial.exists(),
         "proxy network retries must preserve partials"
     );
+}
+
+#[tokio::test]
+async fn dash_progress_keeps_the_catalog_size_when_the_transfer_omits_a_total() {
+    let harness = WorkerHarness::new();
+    let job = build_job(&harness.media_root, "dash-progress-size", JobState::Queued);
+    let store = Arc::new(MockStore::with_jobs([job.clone()]));
+    let mut source = resolved_source("http://example.com/index.mpd", None);
+    source.catalog_size_bytes = Some(2_800_000_000);
+    source.transport = moviebox_tui::catalog::SourceTransport::Dash {
+        maximum_height: 1080,
+        expected_duration_seconds: Some(5400.0),
+    };
+    let catalog = Arc::new(MockCatalog::new([Ok(source)]));
+    let worker = JobWorker::new(
+        store.clone(),
+        catalog,
+        Arc::new(DashProgressThenFailure),
+        harness.namer.clone(),
+        JobEventBus::new(16),
+    )
+    .with_disk_space_checker(Arc::new(MockDiskSpace::new(u64::MAX)));
+
+    worker.run_once().await.unwrap();
+
+    let after = store.job(job.id).await;
+    assert_eq!(after.state, JobState::Queued);
+    assert_eq!(after.downloaded_bytes, 7);
+    assert_eq!(after.total_bytes, Some(2_800_000_000));
 }
 
 #[tokio::test]

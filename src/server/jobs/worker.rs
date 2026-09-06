@@ -610,6 +610,14 @@ where
             return Ok(WorkerRunOutcome::Deferred);
         }
 
+        // Surface the provider's advertised size before the first transfer
+        // sample arrives. DASH reports remuxed output bytes while it is running
+        // and cannot provide a Content-Length of its final MKV.
+        let catalog_expected_size = resolved
+            .catalog_size_bytes
+            .or(resolved.expected_size)
+            .filter(|size| *size > 0);
+
         let downloading = self
             .store
             .transition(
@@ -621,6 +629,26 @@ where
             .await?;
         self.publish(&downloading, JobEventKind::StateChanged);
 
+        let downloading = if let Some(total_bytes) = catalog_expected_size {
+            let with_total = self
+                .store
+                .force_state(
+                    downloading.id,
+                    downloading.version,
+                    JobState::Downloading,
+                    JobEventKind::ProgressUpdated,
+                    JobStatePatch {
+                        total_bytes: Some(Some(total_bytes)),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            self.publish(&with_total, JobEventKind::ProgressUpdated);
+            with_total
+        } else {
+            downloading
+        };
+
         let dash_transfer = matches!(
             &resolved.transport,
             crate::catalog::SourceTransport::Dash { .. }
@@ -629,10 +657,6 @@ where
         // page or promotional clip can be a perfectly complete HTTP response
         // with its own (much smaller) Content-Length; trusting that response
         // alone would publish the wrong video as a successful download.
-        let catalog_expected_size = resolved
-            .catalog_size_bytes
-            .or(resolved.expected_size)
-            .filter(|size| *size > 0);
         let download = self
             .download_with_refresh(downloading, resolved, cancel)
             .await?;
@@ -905,7 +929,7 @@ where
                             JobProgress {
                                 expected_version: current_job.version,
                                 downloaded_bytes: progress.downloaded_bytes,
-                                total_bytes: progress.total_bytes,
+                                total_bytes: current_job.total_bytes.or(progress.total_bytes),
                                 speed_bytes_per_second: progress.speed_bytes_per_second,
                             },
                             None,
@@ -930,7 +954,7 @@ where
                                 JobProgress {
                                     expected_version: current_job.version,
                                     downloaded_bytes: progress.downloaded_bytes,
-                                    total_bytes: progress.total_bytes,
+                                    total_bytes: current_job.total_bytes.or(progress.total_bytes),
                                     speed_bytes_per_second: progress.speed_bytes_per_second,
                                 },
                                 None,

@@ -53,6 +53,15 @@ const jobs = [
   },
 ];
 
+const unknownSizeJob = {
+  ...jobs[0],
+  id: "unknown-size-1",
+  title: "DASH Movie",
+  downloaded_bytes: 524_288_000,
+  total_bytes: null,
+  speed_bytes_per_second: 12_582_912,
+};
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -72,6 +81,17 @@ test("shows progress and the control that matches each job state", async () => {
   expect(screen.getByRole("button", { name: "Resume" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
   expect(screen.getByRole("alert")).toHaveTextContent("The provider is unavailable.");
+
+  fetchMock.mockRestore();
+});
+
+test("shows downloaded bytes and an indeterminate bar while the total is unknown", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => json([unknownSizeJob]));
+  render(<QueuePage />);
+
+  expect(await screen.findByText("DASH Movie")).toBeVisible();
+  expect(screen.getByRole("progressbar", { name: /download progress/i })).toBeVisible();
+  expect(screen.getByText(/500 MB downloaded · 12 MB\/s/i)).toBeVisible();
 
   fetchMock.mockRestore();
 });

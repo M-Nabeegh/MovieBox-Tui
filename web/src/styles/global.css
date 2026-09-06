@@ -621,6 +621,31 @@ img {
   transition: width 400ms var(--ease-out);
 }
 
+.progress-indeterminate span {
+  width: 35%;
+  animation: progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+  50% {
+    transform: translateX(150%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-indeterminate span {
+    width: 55%;
+    animation: none;
+    transform: translateX(0);
+  }
+}
+
 .job-actions {
   display: flex;
   gap: var(--space-2);

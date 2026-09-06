@@ -27,6 +27,10 @@ function remaining(job: Job) {
   return `${Math.ceil(seconds / 60)} min left`;
 }
 
+function isActivelyTransferring(state: JobState) {
+  return ["resolving", "downloading", "finalizing"].includes(state);
+}
+
 export function JobCard({ job, onChanged }: { job: Job; onChanged: () => void }) {
   const [working, setWorking] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -51,6 +55,10 @@ export function JobCard({ job, onChanged }: { job: Job; onChanged: () => void })
     job.total_bytes && job.total_bytes > 0
       ? Math.min(100, (job.downloaded_bytes / job.total_bytes) * 100)
       : null;
+  const indeterminate = percent === null && isActivelyTransferring(job.state);
+  const hasProgress = percent !== null || indeterminate;
+  const hasTransferStats =
+    job.total_bytes !== null || job.downloaded_bytes > 0 || job.speed_bytes_per_second !== null;
 
   async function run(next: "pause" | "resume" | "cancel" | "retry") {
     setWorking(true);
@@ -83,15 +91,25 @@ export function JobCard({ job, onChanged }: { job: Job; onChanged: () => void })
         <span className="job-state">{LABELS[job.state]}</span>
       </div>
 
-      {percent !== null && (
-        <div className="progress">
-          <span style={{ width: `${percent}%` }} />
+      {hasProgress && (
+        <div
+          className={`progress${indeterminate ? " progress-indeterminate" : ""}`}
+          role="progressbar"
+          aria-label="Download progress"
+          aria-valuemin={0}
+          aria-valuemax={percent !== null ? 100 : undefined}
+          aria-valuenow={percent !== null ? Math.round(percent) : undefined}
+          aria-valuetext={percent !== null ? `${Math.round(percent)}% downloaded` : "Download size calculating"}
+        >
+          <span style={percent !== null ? { width: `${percent}%` } : undefined} />
         </div>
       )}
 
-      {job.total_bytes !== null && (
+      {hasTransferStats && (
         <p className="card-meta">
-          {size(job.downloaded_bytes)} of {size(job.total_bytes)}
+          {job.total_bytes !== null
+            ? `${size(job.downloaded_bytes)} of ${size(job.total_bytes)}`
+            : `${size(job.downloaded_bytes)} downloaded`}
           {job.speed_bytes_per_second ? ` · ${size(job.speed_bytes_per_second)}/s` : ""}
           {remaining(job) ? ` · ${remaining(job)}` : ""}
         </p>

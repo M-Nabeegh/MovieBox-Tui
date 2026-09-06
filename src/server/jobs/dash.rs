@@ -61,6 +61,11 @@ const DASH_PROXY_CONNECTIONS: usize = 4;
 const DASH_PROXY_HEADER_TIMEOUT: Duration = Duration::from_millis(250);
 const DASH_PROXY_MAX_HEADER_BYTES: usize = 64 * 1024;
 
+fn transfer_speed(previous_bytes: u64, current_bytes: u64, elapsed: Duration) -> Option<u64> {
+    let seconds = elapsed.as_secs_f64();
+    (seconds > 0.0).then(|| (current_bytes.saturating_sub(previous_bytes) as f64 / seconds) as u64)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MediaProbe {
     pub has_video: bool,
@@ -235,6 +240,8 @@ impl DashTransfer {
             let monitor_output = temporary.clone();
             let monitor_progress = progress.clone();
             let monitor = MonitorGuard::new(tokio::spawn(async move {
+                let mut previous_bytes = 0;
+                let mut previous_sample = Instant::now();
                 loop {
                     if monitor_cancel.is_cancelled() {
                         break;
@@ -243,10 +250,18 @@ impl DashTransfer {
                         .await
                         .map(|metadata| metadata.len())
                         .unwrap_or_default();
+                    let sampled_at = Instant::now();
+                    let speed = transfer_speed(
+                        previous_bytes,
+                        bytes,
+                        sampled_at.duration_since(previous_sample),
+                    );
+                    previous_bytes = bytes;
+                    previous_sample = sampled_at;
                     let _ = monitor_progress.send(TransferProgress {
                         downloaded_bytes: bytes,
                         total_bytes: None,
-                        speed_bytes_per_second: None,
+                        speed_bytes_per_second: speed,
                     });
                     sleep(Duration::from_millis(250)).await;
                 }
@@ -1844,7 +1859,7 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DashCapability, parse_dash_manifest, template_matches};
+    use super::{DashCapability, parse_dash_manifest, template_matches, transfer_speed};
     use std::net::Ipv4Addr;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1853,6 +1868,13 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
     use url::Url;
+
+    #[test]
+    fn dash_speed_is_based_on_bytes_added_since_the_previous_sample() {
+        assert_eq!(transfer_speed(100, 300, Duration::from_secs(2)), Some(100));
+        assert_eq!(transfer_speed(300, 100, Duration::from_secs(2)), Some(0));
+        assert_eq!(transfer_speed(100, 200, Duration::ZERO), None);
+    }
 
     #[test]
     fn capability_templates_preserve_dash_variables_and_query_strings() {
