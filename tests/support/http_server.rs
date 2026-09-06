@@ -147,6 +147,21 @@ impl FixtureServer {
             .expect("fixture client")
     }
 
+    pub fn client_with_resolver<R>(&self, resolver: R) -> DownloadClient
+    where
+        R: AddressResolver + 'static,
+    {
+        DownloadClient::builder()
+            .resolve(FIXTURE_HOST, self.address)
+            .resolver(resolver)
+            .test_peer_address(SocketAddr::new(
+                IpAddr::V4(TEST_PUBLIC_IP),
+                self.address.port(),
+            ))
+            .build()
+            .expect("fixture client")
+    }
+
     pub fn mismatched_client(&self) -> DownloadClient {
         DownloadClient::builder()
             .resolve(FIXTURE_HOST, self.address)

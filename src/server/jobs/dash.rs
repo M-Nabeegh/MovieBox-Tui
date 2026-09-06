@@ -5,6 +5,7 @@
 //! stream before the worker can publish the file.
 
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
@@ -39,7 +40,9 @@ use url::Url;
 use crate::{
     catalog::SourceTransport,
     download::{DownloadClient, DownloadError, DownloadOutcome, DownloadRequest},
-    server::security::net::{NetSecurityError, follow_checked_redirects_same_origin},
+    server::security::net::{
+        NetSecurityError, ValidatedPeerCache, follow_checked_redirects_same_origin_with_peer_cache,
+    },
 };
 
 use super::worker::TransferProgress;
@@ -151,14 +154,16 @@ impl DashTransfer {
             return Ok(DownloadOutcome::Paused { bytes: 0 });
         }
         let expected_duration = require_provider_duration(expected_duration_seconds)?;
+        let trusted_peers: ValidatedPeerCache = Arc::new(Mutex::new(BTreeSet::new()));
         let response = tokio::select! {
-            response = follow_checked_redirects_same_origin(
+            response = follow_checked_redirects_same_origin_with_peer_cache(
                 &self.client,
                 Method::GET,
                 request.url.clone(),
                 request.headers.clone(),
                 request.maximum_redirects,
                 request.url.clone(),
+                Arc::clone(&trusted_peers),
             ) => response.map_err(DownloadError::from)?,
             _ = cancel.cancelled() => return Ok(DownloadOutcome::Paused { bytes: 0 }),
         };
@@ -195,6 +200,7 @@ impl DashTransfer {
             request.headers.clone(),
             request.maximum_redirects,
             cancel.clone(),
+            trusted_peers,
         )
         .await?;
         validate_proxy_tool_url(&proxy.url)?;
@@ -504,6 +510,7 @@ struct DashProxyState {
     failure: Arc<Mutex<Option<ProxyFailure>>>,
     cancel: CancellationToken,
     connections: Arc<Semaphore>,
+    trusted_peers: ValidatedPeerCache,
 }
 
 struct DashProxy {
@@ -522,6 +529,7 @@ impl DashProxy {
         headers: HeaderMap,
         maximum_redirects: u8,
         cancel: CancellationToken,
+        trusted_peers: ValidatedPeerCache,
     ) -> Result<Self, DashError> {
         let proxy_cancel = cancel.child_token();
         let token = random_proxy_token();
@@ -546,6 +554,7 @@ impl DashProxy {
             failure: Arc::clone(&failure),
             cancel: proxy_cancel.clone(),
             connections: Arc::new(Semaphore::new(DASH_PROXY_CONNECTIONS)),
+            trusted_peers,
         };
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let task_cancel = proxy_cancel.clone();
@@ -671,7 +680,6 @@ async fn serve_dash_proxy_connection(
     let upstream = match proxy_target_url(&state, &local_url) {
         Ok(upstream) => upstream,
         Err(_) => {
-            eprintln!("DASH proxy rejected a manifest capability request");
             write_dash_proxy_headers(
                 &mut stream,
                 StatusCode::NOT_FOUND,
@@ -689,13 +697,14 @@ async fn serve_dash_proxy_connection(
         }
     }
     let response = tokio::select! {
-        response = follow_checked_redirects_same_origin(
+        response = follow_checked_redirects_same_origin_with_peer_cache(
             &state.client,
             Method::GET,
             upstream,
             headers,
             state.maximum_redirects,
             state.origin.clone(),
+            Arc::clone(&state.trusted_peers),
         ) => response,
         _ = state.cancel.cancelled() => return Ok(()),
     };
@@ -743,21 +752,6 @@ async fn serve_dash_proxy_connection(
 }
 
 fn classify_proxy_failure(error: &NetSecurityError) -> ProxyFailure {
-    let reason = match error {
-        NetSecurityError::InvalidScheme(_) => "invalid_scheme",
-        NetSecurityError::MissingHost => "missing_host",
-        NetSecurityError::DnsLookup { .. } => "dns_lookup",
-        NetSecurityError::NoResolvedAddresses(_) => "no_resolved_addresses",
-        NetSecurityError::UnsafeAddress(_) => "unsafe_address",
-        NetSecurityError::ConnectedAddressUnavailable => "connected_address_unavailable",
-        NetSecurityError::ConnectedAddressMismatch(_) => "connected_address_mismatch",
-        NetSecurityError::MissingRedirectLocation => "missing_redirect_location",
-        NetSecurityError::InvalidRedirectTarget(_) => "invalid_redirect_target",
-        NetSecurityError::RedirectOutsideOrigin => "redirect_outside_origin",
-        NetSecurityError::RedirectLimitExceeded(_) => "redirect_limit_exceeded",
-        NetSecurityError::Request(_) => "request",
-    };
-    eprintln!("DASH proxy upstream request rejected (reason={reason})");
     match error {
         NetSecurityError::Request(_) => ProxyFailure::Network,
         _ => ProxyFailure::Security,

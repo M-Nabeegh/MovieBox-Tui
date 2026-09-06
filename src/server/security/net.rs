@@ -10,13 +10,16 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use thiserror::Error;
 use url::{Host, Origin, Url};
 
 pub type ResolveFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + 'a>>;
+
+/// Public peers already validated for one approved same-origin transfer.
+pub type ValidatedPeerCache = Arc<Mutex<BTreeSet<IpAddr>>>;
 
 pub trait AddressResolver: Send + Sync {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a>;
@@ -293,7 +296,8 @@ pub async fn follow_checked_redirects(
     headers: HeaderMap,
     maximum_redirects: u8,
 ) -> Result<DownloadResponse, NetSecurityError> {
-    follow_checked_redirects_inner(client, method, url, headers, maximum_redirects, None).await
+    follow_checked_redirects_inner(client, method, url, headers, maximum_redirects, None, None)
+        .await
 }
 
 /// Follow redirects while keeping every request on one approved origin.
@@ -317,6 +321,32 @@ pub async fn follow_checked_redirects_same_origin(
         headers,
         maximum_redirects,
         Some(approved_origin),
+        None,
+    )
+    .await
+}
+
+/// Follow same-origin redirects while retaining peers already validated for
+/// this one transfer. CDNs may rotate DNS answers during long DASH downloads,
+/// while reqwest can reuse a connection opened against an earlier answer.
+pub async fn follow_checked_redirects_same_origin_with_peer_cache(
+    client: &DownloadClient,
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    maximum_redirects: u8,
+    approved_origin: Url,
+    trusted_peers: ValidatedPeerCache,
+) -> Result<DownloadResponse, NetSecurityError> {
+    let approved_origin = approved_origin.origin();
+    follow_checked_redirects_inner(
+        client,
+        method,
+        url,
+        headers,
+        maximum_redirects,
+        Some(approved_origin),
+        Some(trusted_peers),
     )
     .await
 }
@@ -328,6 +358,7 @@ async fn follow_checked_redirects_inner(
     headers: HeaderMap,
     maximum_redirects: u8,
     approved_origin: Option<Origin>,
+    trusted_peers: Option<ValidatedPeerCache>,
 ) -> Result<DownloadResponse, NetSecurityError> {
     let mut current = url;
     if approved_origin
@@ -341,7 +372,28 @@ async fn follow_checked_redirects_inner(
         let response = client
             .send(method.clone(), current.clone(), headers.clone())
             .await?;
-        validate_connected_peer(&validated_addresses, response.remote_addr())?;
+        let remote_addr = response.remote_addr();
+        match validate_connected_peer(&validated_addresses, remote_addr) {
+            Ok(()) => {
+                if let Some(remote_addr) = remote_addr
+                    && let Some(trusted_peers) = trusted_peers.as_ref()
+                    && let Ok(mut peers) = trusted_peers.lock()
+                {
+                    peers.insert(normalize_ip(remote_addr.ip()));
+                }
+            }
+            Err(NetSecurityError::ConnectedAddressMismatch(_))
+                if remote_addr.is_some_and(|remote_addr| {
+                    ensure_public_address(remote_addr.ip()).is_ok()
+                        && trusted_peers.as_ref().is_some_and(|trusted_peers| {
+                            trusted_peers
+                                .lock()
+                                .map(|peers| peers.contains(&normalize_ip(remote_addr.ip())))
+                                .unwrap_or(false)
+                        })
+                }) => {}
+            Err(error) => return Err(error),
+        }
 
         if !response.status().is_redirection() {
             return Ok(response);

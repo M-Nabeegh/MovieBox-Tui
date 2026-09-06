@@ -7,21 +7,45 @@ use moviebox_tui::{
     download::{DownloadRequest, download},
     server::security::{
         net::{
-            follow_checked_redirects, follow_checked_redirects_same_origin,
-            resolve_public_addresses, validate_public_http_url,
+            AddressResolver, ResolveFuture, follow_checked_redirects,
+            follow_checked_redirects_same_origin,
+            follow_checked_redirects_same_origin_with_peer_cache, resolve_public_addresses,
+            validate_public_http_url,
         },
         path::contained_path,
     },
 };
 use reqwest::Method;
 use std::{
+    collections::BTreeSet,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 use support::http_server::FixtureServer;
 use tempfile::tempdir;
 use tokio::fs;
 use url::Url;
+
+#[derive(Clone)]
+struct RotatingResolver {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AddressResolver for RotatingResolver {
+    fn resolve<'a>(&'a self, _host: &'a str, port: u16) -> ResolveFuture<'a> {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let address = if call == 0 {
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))
+        } else {
+            IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1))
+        };
+        Box::pin(async move { Ok(vec![SocketAddr::new(address, port)]) })
+    }
+}
 
 #[tokio::test]
 async fn download_sends_required_headers_on_redirects_segment_retries_and_resume() {
@@ -202,6 +226,43 @@ async fn scoped_redirects_reject_a_different_remote_origin_before_forwarding_aut
 
     assert!(error.to_string().contains("origin"));
     assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn same_origin_dash_requests_keep_a_peer_validated_before_dns_rotation() {
+    let server = FixtureServer::start(1024).await.unwrap();
+    let client = server.client_with_resolver(RotatingResolver {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let trusted_peers = Arc::new(Mutex::new(BTreeSet::new()));
+    let origin = server.url("/download");
+
+    let response = follow_checked_redirects_same_origin_with_peer_cache(
+        &client,
+        reqwest::Method::GET,
+        origin.clone(),
+        FixtureServer::required_headers(),
+        2,
+        origin.clone(),
+        Arc::clone(&trusted_peers),
+    )
+    .await
+    .unwrap();
+    response.bytes().await.unwrap();
+
+    let response = follow_checked_redirects_same_origin_with_peer_cache(
+        &client,
+        reqwest::Method::GET,
+        origin.clone(),
+        FixtureServer::required_headers(),
+        2,
+        origin,
+        trusted_peers,
+    )
+    .await
+    .unwrap();
+    response.bytes().await.unwrap();
+    assert_eq!(server.requests().len(), 2);
 }
 
 #[tokio::test]
